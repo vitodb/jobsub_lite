@@ -208,7 +208,8 @@ def main():
 
     # While we're running in hybrid proxy/token mode, force us to get a new proxy every time we submit
     # Eventually, this arg and its support in the underlying libraries should be removed
-    args.force_proxy = True
+    #args.force_proxy = True
+    args.force_proxy = False
 
     varg = vars(args)
 
