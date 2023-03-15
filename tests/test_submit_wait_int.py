@@ -130,6 +130,7 @@ def dune_gp(dune):
 joblist = []
 jid2test = {}
 outdirs = {}
+ddirs = {}
 
 
 def run_launch(cmd):
@@ -189,6 +190,15 @@ def lookaround_launch(extra, verify_files=""):
 @pytest.mark.integration
 def test_launch_lookaround_samdev(samdev):
     lookaround_launch("--devserver")
+
+
+@pytest.mark.integration
+def test_launch_lookaround_ddir(samdev):
+    pid = os.getpid()
+    ddir = f"/pnfs/fermilab/users/$USER/d{pid}"
+    fake_ifdh.mkdir_p(ddir)
+    lookaround_launch(f"--devserver -d D1 {ddir}")
+    ddirs[joblist[-1]] = ddir
 
 
 @pytest.mark.integration
@@ -419,6 +429,11 @@ def test_fetch_output():
 
 @pytest.mark.integration
 def test_check_job_output():
+    for jid, ddir in ddirs.items():
+        print(f"Checking {jid2test[jid]} {jid} -d tag  {ddir}...")
+        fl = fake_ifdh.ls(ddir)
+        assert len(fl)
+
     for jid, outdir in outdirs.items():
         fl = glob.glob("%s/*.log" % outdir)
         for f in fl:
@@ -432,3 +447,55 @@ def test_check_job_output():
             fd.close()
             assert f_ok
         shutil.rmtree(outdir)
+
+
+@pytest.mark.integration
+def test_valid_constraint_space(samdev):
+    lookaround_launch("--devserver")
+    if len(joblist) == 0:
+        raise AssertionError("No jobs submitted")
+    jid = joblist[-1]
+    group = group_for_job(jid)
+    user = os.environ["USER"]
+    cmd = f"jobsub_q -G {group} --constraint 'Owner==\"{user}\"'  --jobid={jid} -format '%s' ClusterId"
+    with os.popen(cmd) as query:
+        output = query.readlines()
+        assert len(output) == 1 and output[0] in jid
+
+
+@pytest.mark.integration
+def test_valid_constraint_equal(samdev):
+    lookaround_launch("--devserver")
+    if len(joblist) == 0:
+        raise AssertionError("No jobs submitted")
+    jid = joblist[-1]
+    group = group_for_job(jid)
+    user = os.environ["USER"]
+    cmd = f"jobsub_q -G {group} --constraint='Owner==\"{user}\"'  --jobid={jid} -format '%s' ClusterId"
+    with os.popen(cmd) as query:
+        output = query.readlines()
+        assert len(output) == 1 and output[0] in jid
+
+
+@pytest.mark.integration
+def test_invalid_constraint_space(samdev):
+    cmd = f"jobsub_q -G fermilab --constraint 'thisisabadconstraintbutwillparse==true'"
+    query = os.popen(cmd)
+    output = query.readlines()
+    assert len(output) == 0
+    rc = query.close()
+    assert (
+        rc is None
+    )  # We got a 0 return code from the query even if it returned nothing
+
+
+@pytest.mark.integration
+def test_invalid_constraint_equal(samdev):
+    cmd = f"jobsub_q -G fermilab --constraint='thisisabadconstraintbutwillparse==true'"
+    query = os.popen(cmd)
+    output = query.readlines()
+    assert len(output) == 0
+    rc = query.close()
+    assert (
+        rc is None
+    )  # We got a 0 return code from the query even if it returned nothing

@@ -7,9 +7,6 @@
 
 umask 002
 
-# add a copy as our original name so the wrapper is in the job output
-cp $0 {{script_name|default('simple.sh')}}
-
 {% if not no_env_cleanup %}
 #
 # clear out variables that sometimes bleed into containers
@@ -117,12 +114,6 @@ redirect_output_finish(){
     {% set filebase %}{{executable|basename}}{{datetime}}{{uuid}}cluster.$CLUSTER.$PROCESS{% endset %}
     IFDH_CP_MAXRETRIES=1 ${JSB_TMP}/ifdh.sh cp ${JSB_TMP}/JOBSUB_ERR_FILE.truncated {{outurl}}/{{filebase}}.err
     IFDH_CP_MAXRETRIES=1 ${JSB_TMP}/ifdh.sh cp ${JSB_TMP}/JOBSUB_LOG_FILE.truncated {{outurl}}/{{filebase}}.out
-    # copy script and jdf out to dcache sandbox
-    if [ "$PROCESS" -eq 0 ]; then
-        IFDH_CP_MAXRETRIES=0 ${JSB_TMP}/ifdh.sh cp $JOBSUB_EXE_SCRIPT {{outurl}}/{{executable|basename}}
-        {% set cmdfile %}{{cmd_name|default('simple.cmd')}}{% endset %}
-        IFDH_CP_MAXRETRIES=0 ${JSB_TMP}/ifdh.sh cp {{cmdfile}} {{outurl}}/{{cmdfile}}
-    fi
     {%endif%}
 }
 
@@ -262,7 +253,7 @@ chmod u+x ${CONDOR_DIR_INPUT}/{{fname|basename}}
     mkdir .unwind_{{loop.index0}}
     {%set tflocal = '.unwind_%d/%s' % (loop.index0, tfname|basename) %}
     ${JSB_TMP}/ifdh.sh cp {{tfname}} {{tflocal}}
-    tar --directory .unwind_{{loop.index0}} -xzvf {{tflocal}}
+    tar --directory .unwind_{{loop.index0}} -xjvf {{tflocal}}
     {%if loop.first%}
       INPUT_TAR_DIR_LOCAL=`pwd`/.unwind_{{loop.index0}}
       export INPUT_TAR_DIR_LOCAL
@@ -281,7 +272,7 @@ chmod u+x ${CONDOR_DIR_INPUT}/{{fname|basename}}
 
 # -d directories for output
 {%for pair in d%}
-export CONDOR_DIR_{{pair[0]}}=out_{{pair[0]}}
+export CONDOR_DIR_{{pair[0]}}=`pwd`/out_{{pair[0]}}
 mkdir $CONDOR_DIR_{{pair[0]}}
 {%endfor%}
 
