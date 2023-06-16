@@ -8,6 +8,8 @@ jobsub_submit
                      [--blacklist BLACKLIST] [-r R] [-i I] [-t T]
                      [--cmtconfig CMTCONFIG] [--cpu CPU] [--dag DAG]
                      [--dataset-definition DATASET_DEFINITION]
+                     [--dd-percentage DD_PERCENTAGE]
+                     [--dd-extra-dataset DD_EXTRA_DATASET]
                      [--debug DEBUG]
                      [--disk DISK] [-d tag dir] [--email-to EMAIL_TO]
                      [-e ENVIRONMENT]
@@ -47,6 +49,10 @@ optional arguments:
 .HP
 -h, --help            show this help message and exit
 .HP
+--global-pool GLOBAL_POOL
+                      direct jobs/commands to a particular known global
+                      pool. Currently known pools are: ['dune']
+.HP
 -c APPEND_CONDOR_REQUIREMENTS, --append-condor-requirements APPEND_CONDOR_REQUIREMENTS, --append_condor_requirements APPEND_CONDOR_REQUIREMENTS
 append condor requirements
 .HP
@@ -70,6 +76,12 @@ configuration. default is $CMTCONFIG
 --dataset-definition DATASET_DEFINITION, --dataset_definition DATASET_DEFINITION, --dataset DATASET_DEFINITION
 SAM dataset definition used in a Directed Acyclic
 Graph (DAG)
+.HP
+--dd-percentage DD_PERCENTAGE
+                      percentage to apply to SAM dataset size for --dataset-definition start job.
+.HP
+--dd-extra-dataset DD_EXTRA_DATASET
+                      SAM dataset definition start script extra dataset to check as staged. You can add multiple of them.
 .HP
 --debug DEBUG         Turn on debugging
 .HP
@@ -151,10 +163,10 @@ scopes needed in job tokens
 never send mail about job results (default)
 .HP
 --mail_on_error, --mail-on-error
-never send mail about job results (default)
+send mail about job results if job fails
 .HP
 --mail_always, --mail-always
-never send mail about job results (default)
+send mail about job results
 .HP
 --maxConcurrent MAXCONCURRENT
 max number of jobs running concurrently at given time.
@@ -209,8 +221,13 @@ and '&&(CVMFS=="OSG")' to the job requirements
 .HP
 --site SITE           submit jobs to these (comma-separated) sites
 .HP
---tar_file_name TAR_FILE_NAME, --tar-file-name TAR_FILE_NAME
-dropbox://PATH/TO/TAR_FILE tardir://PATH/TO/DIRECTORY
+--skip-check SKIP_CHECK
+Skip checks that jobsub_lite does by default. Add as
+many --skip-check flags as desired. Available checks
+are ['rcds']. Example: --skip-check rcds
+.HP
+--tar-file-name dropbox://PATH/TO/TAR_FILE,
+--tar-file-name tardir://PATH/TO/DIRECTORY
 specify TAR_FILE or DIRECTORY to be transferred to
 worker node.  TAR_FILE will be copied with RCDS/cvmfs
 (or /pnfs), transferred to the job and unpacked there.

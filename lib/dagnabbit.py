@@ -17,6 +17,7 @@
 import sys
 import os
 import os.path
+import re
 from typing import Dict, List, Any
 
 import jinja2 as jinja  # type: ignore
@@ -43,6 +44,8 @@ def parse_dagnabbit(
     jinja_env = jinja.Environment(loader=jinja.FileSystemLoader(srcdir))
     jinja_env.filters["basename"] = os.path.basename
     proxy, token = creds.get_creds(values)
+    prev_jobsub_line = "xxx"
+    prev_jobsub_count = 0
     count = 0
     linenum = 0
     pstack: List[List[List[str]]] = []
@@ -73,7 +76,7 @@ def parse_dagnabbit(
             if line.find("<parallel>") >= 0:
                 if in_parallel:
                     sys.stderr.write(
-                        f"Error: file {values['dag']} line {linenum}: <parallel>"
+                        f"Error: file {dagfile} line {linenum}: <parallel>"
                         f" inside <parallel> not currently supported\n"
                     )
                     sys.exit(1)
@@ -133,50 +136,96 @@ def parse_dagnabbit(
                 in_postscript = False
                 count = count + 1
                 name = f"stage_{count}"
-                parser = get_parser()
-                try:
-                    line_argv = line.strip().split()[1:]
-                    backslash_escape_layer(line_argv)
-                    res = parser.parse_args(line_argv)
-                except:
-                    sys.stderr.write(f"Error at file {values['dag']} line {linenum}\n")
-                    sys.stderr.write(f"parsing: {line.strip().split()}\n")
-                    sys.stderr.flush()
-                    raise
-                # print(f"vars(res): {repr(vars(res))}")
-                # handle -f drobpox: etc. in dag stages
-                do_tarballs(res)
-                thesevalues = values.copy()
-                thesevalues["N"] = 1
-                thesevalues["dag"] = None
-                # don't take executable from command line, only from DAG file
-                if "full_executable" in thesevalues:
-                    del thesevalues["full_executable"]
-                if "executable" in thesevalues:
-                    del thesevalues["executable"]
 
-                # we get a bunch of defaults from the command line parser that
-                # we don't want to override from the initial command line
-                update_with: Dict[str, Any] = vars(res)
-                kl = list(update_with.keys())
-                for k in kl:
-                    if update_with[k] is parser.get_default(k):
-                        del update_with[k]
+                # replace integer params matching count-2 with $(CM2)
+                # (which we will pass in as a dag # job parameter)
+                # to assist compaction...
+                # ONLY do the very end
+                line = re.sub(f"\\b{count-2}\\s*$", "$(CM2)", line)
+                line = re.sub(f"\\b{count-1}\\s*$", "$(CM1)", line)
 
-                thesevalues.update(update_with)
-                set_extras_n_fix_units(thesevalues, schedd_name, proxy, token)
-                thesevalues["script_name"] = f"{name}.sh"
-                thesevalues["cmd_name"] = f"{name}.cmd"
-                with open(
-                    os.path.join(dest, f"{name}.cmd"), "w", encoding="UTF-8"
-                ) as cf:
-                    cf.write(jinja_env.get_template("simple.cmd").render(**thesevalues))
-                with open(
-                    os.path.join(dest, f"{name}.sh"), "w", encoding="UTF-8"
-                ) as csf:
-                    csf.write(jinja_env.get_template("simple.sh").render(**thesevalues))
-                of.write(f"\nJOB {name} {name}.cmd\n")
-                of.write(f'VARS {name} JOBSUBJOBSECTION="{count}" nodename="$(JOB)"\n')
+                if line == prev_jobsub_line:
+
+                    prevname = f"stage_{prev_jobsub_count}"
+                    # if it is the same as the last jobsub line, just reuse the same cmd file, which
+                    # uses the same wrapper script, etc.  This considerably trims, for example,the
+                    # dag output of project.py which will happily write 1000 identical worker stages..
+                    of.write(f"\nJOB {name} {prevname}.cmd\n")
+                    of.write(
+                        f'VARS {name} JOBSUBJOBSECTION="{count}" CM2="{count-2}" CM1="{count-1}" nodename="$(JOB)"\n'
+                    )
+
+                else:
+
+                    prev_jobsub_line = line
+                    prev_jobsub_count = count
+
+                    parser = get_parser()
+                    try:
+                        line_argv = line.strip().split()[1:]
+                        backslash_escape_layer(line_argv)
+                        res = parser.parse_args(line_argv)
+                    except:
+                        sys.stderr.write(
+                            f"Syntax Error at file {dagfile} line {linenum}\n"
+                        )
+                        sys.stderr.write(f"parsing: {line.strip().split()}\n")
+                        sys.stderr.flush()
+                        raise
+                    # print(f"vars(res): {repr(vars(res))}")
+                    # handle -f drobpox: etc. in dag stages
+                    do_tarballs(res)
+                    thesevalues = values.copy()
+                    thesevalues["mail"] = "never"
+                    thesevalues["N"] = 1
+                    thesevalues["dag"] = None
+                    # don't take executable from command line, only from DAG file
+                    if "full_executable" in thesevalues:
+                        del thesevalues["full_executable"]
+                    if "executable" in thesevalues:
+                        del thesevalues["executable"]
+
+                    # we get a bunch of defaults from the command line parser that
+                    # we don't want to override from the initial command line
+                    update_with: Dict[str, Any] = vars(res)
+                    kl = list(update_with.keys())
+                    for k in kl:
+                        if update_with[k] is parser.get_default(k):
+                            del update_with[k]
+
+                    # the list ones here do  not get cleaned out by the above
+                    for k in ["input_file", "tar_file_name", "tar_file_orig_basenames"]:
+                        if not update_with[k]:
+                            del update_with[k]
+
+                    # do not just update, rather update but also merge items that are lists
+                    for k in update_with:
+                        if isinstance(thesevalues.get(k, False), List):
+                            # note this has to be a list plus, if you do thesevalues[k].extend(update_with[k]) you
+                            # keep expanding the original list and the values pile up
+                            thesevalues[k] = thesevalues[k] + update_with[k]
+                        else:
+                            thesevalues[k] = update_with[k]
+
+                    set_extras_n_fix_units(thesevalues, schedd_name, proxy, token)
+                    thesevalues["script_name"] = f"{name}.sh"
+                    thesevalues["cmd_name"] = f"{name}.cmd"
+                    with open(
+                        os.path.join(dest, f"{name}.cmd"), "w", encoding="UTF-8"
+                    ) as cf:
+                        cf.write(
+                            jinja_env.get_template("simple.cmd").render(**thesevalues)
+                        )
+                    with open(
+                        os.path.join(dest, f"{name}.sh"), "w", encoding="UTF-8"
+                    ) as csf:
+                        csf.write(
+                            jinja_env.get_template("simple.sh").render(**thesevalues)
+                        )
+                    of.write(f"\nJOB {name} {name}.cmd\n")
+                    of.write(
+                        f'VARS {name} JOBSUBJOBSECTION="{count}" CM2="{count-2}" CM1="{count-1}" nodename="$(JOB)"\n'
+                    )
 
                 if in_serial:
                     if not last_serial_in:
@@ -196,7 +245,7 @@ def parse_dagnabbit(
                     of.write("# saw prescript\n")
                 if in_prescript:
                     sys.stderr.write(
-                        f"Error: file {dagfile} line {linenum}\n"
+                        f"Syntax Error: file {dagfile} line {linenum}\n"
                         f" only 1 prescript line per jobsub line is allowed\n"
                     )
                     sys.exit(1)
@@ -206,7 +255,7 @@ def parse_dagnabbit(
                 try:
                     res = parser.parse_args(line.strip().split()[1:])
                 except:
-                    sys.stderr.write(f"Error at file {dagfile} line {linenum}\n")
+                    sys.stderr.write(f"Syntax Error: file {dagfile} line {linenum}\n")
                     sys.stderr.write(f"parsing: {line.strip().split()}\n")
                     sys.stderr.flush()
                     raise
@@ -223,7 +272,7 @@ def parse_dagnabbit(
                     of.write("# saw postscript\n")
                 if in_postscript:
                     sys.stderr.write(
-                        f"Error: file {dagfile} line {linenum}\n"
+                        f"Syntax Error: file {dagfile} line {linenum}\n"
                         f" only 1 postscript line per jobsub line is allowed\n"
                     )
                     sys.exit(1)
@@ -233,7 +282,7 @@ def parse_dagnabbit(
                 try:
                     res = parser.parse_args(line.strip().split()[1:])
                 except:
-                    sys.stderr.write(f"Error at file {dagfile} line {linenum}\n")
+                    sys.stderr.write(f"Syntax Error: file {dagfile} line {linenum}\n")
                     sys.stderr.write(f"parsing: {line.strip().split()}\n")
                     sys.stderr.flush()
                     raise
@@ -245,11 +294,13 @@ def parse_dagnabbit(
                 thesevalues.update(update_with)
                 set_extras_n_fix_units(thesevalues, schedd_name, proxy, token)
 
-            elif not line:
-                # blank lines are fine
+            elif not line.strip() or line.strip().startswith("#"):
+                # blank lines and comments are fine
                 pass
             else:
-                sys.stderr.write(f"Syntax Error: ignoring {line} at line {linenum}\n")
+                sys.stderr.write(
+                    f"Syntax Error: file {dagfile} ignoring {line} at line {linenum}\n"
+                )
 
         if values["maxConcurrent"]:
             of.write("CONFIG dagmax.config\n")

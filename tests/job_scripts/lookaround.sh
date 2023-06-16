@@ -27,9 +27,7 @@ then
 fi
 done
 setup htgettoken
-setup ifdhc v2_6_0 -q python36, ifdhc_config v2_6_0
-export IFDH_TOKEN_ENABLE=1
-export IFDH_PROXY_ENABLE=0
+setup ifdhc
 ups active
 
 echo "============"
@@ -57,3 +55,16 @@ do
        exit 1
    fi
 done
+
+# put something in any -d TAG /return/path areas for testing
+outdirs=`printenv | grep '^CONDOR_DIR_' | sed -e 's/=.*//'`
+echo "=== out dirs: $outdirs ==="
+for od in $outdirs
+do
+   eval "echo $od = \$$od"
+   eval "echo test $od > \$$od/testout.txt"
+done
+
+# now sleep for a bit
+sleep 300
+exit 0

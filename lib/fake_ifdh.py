@@ -138,7 +138,7 @@ def getToken(role: str = DEFAULT_ROLE, verbose: int = 0) -> str:
             raise PermissionError(f"Failed attempting '{cmd}'")
         if checkToken(tokenfile):
             return tokenfile
-        raise PermissionError(f"Failed attempting '{cmd}'")
+        raise PermissionError(f"Failed validating token from '{cmd}'")
     return tokenfile
 
 
@@ -234,6 +234,10 @@ gfal_clean_env = (
 
 
 def fix_pnfs(path: str) -> str:
+
+    if path[0] == "/":
+        path = os.path.realpath(path)
+
     # use nfs4 mount if present
     mountpoint_end = path.find("/", 7)
     if os.path.isdir(path[:mountpoint_end]):
@@ -244,6 +248,17 @@ def fix_pnfs(path: str) -> str:
     if m:
         path = f"https://fndcadoor.fnal.gov:2880/{m.group(1)}"
     return path
+
+
+def chmod(dest: str, mode: int) -> None:
+    # can't really chmod over https, but can over nfs mount, so
+    # just try with the raw path, and ignore it if it doesn't work
+    try:
+        os.chmod(dest, mode)
+    except FileNotFoundError as e:
+        pass
+    except PermissionError as e:
+        pass
 
 
 def mkdir_p(dest: str) -> None:

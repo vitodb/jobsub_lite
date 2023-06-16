@@ -23,16 +23,22 @@
 # pylint: disable=wrong-import-position,wrong-import-order,import-error
 
 import argparse
+from collections import defaultdict
 import os
 import sys
 import re
+
+if os.environ.get("LD_LIBRARY_PATH", ""):
+    del os.environ["LD_LIBRARY_PATH"]
+    os.execv(sys.argv[0], sys.argv)
 
 PREFIX = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(PREFIX, "lib"))
 
 import fake_ifdh
 import get_parser
-import version
+import condor
+from version import print_version, print_support_email
 
 
 class StoreGroupinEnvironment(argparse.Action):
@@ -45,8 +51,12 @@ class StoreGroupinEnvironment(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+verbose = 0
+
+
 def main() -> None:
     """main line of code, proces args, etc."""
+    global verbose
     parser = get_parser.get_jobid_parser(add_condor_epilog=True)
     parser.add_argument("-name", help="Set schedd name", default=None)
     parser.add_argument(
@@ -61,14 +71,13 @@ def main() -> None:
         parser.add_argument("--user", help="username to query", default=None)
 
     arglist, passthru = parser.parse_known_args()
+    verbose = arglist.verbose
 
     if arglist.version:
-        print(f"jobsub_lite version {version.__version__}")
-        exit()
+        print_version()
 
     if arglist.support_email:
-        print(f"Email {version.__email__} for help.")
-        exit()
+        print_support_email()
 
     if cmd != "jobsub_q":
         arglist.user = None
@@ -78,9 +87,13 @@ def main() -> None:
         passthru.append("-debug")
     # if they gave us --jobid or --user put in the value plain, condor figures it out
     if arglist.jobid:
-        passthru.append(arglist.jobid)
+        for jid in arglist.jobid.split(","):
+            passthru.append(jid)
     if arglist.user:
         passthru.append(arglist.user)
+    # If they gave us --constraint, sanitize it and add to passthru
+    if arglist.constraint:
+        passthru.extend(["-constraint", arglist.constraint])
 
     if os.environ.get("GROUP", None) is None:
         raise SystemExit(f"{sys.argv[0]} needs -G group or $GROUP in the environment.")
@@ -90,10 +103,12 @@ def main() -> None:
     #   any 234@schedd style arguments, pick out the schedd and
     #   keep the 234, and pass --name schedd as well
     execargs = []
-    schedd = None
+    schedd_list = set()
+    # save beginning of 1234@schedd in list of args for that schedd
+    args_for_schedd = defaultdict(list)
 
     if arglist.name:
-        schedd = arglist.name
+        schedd_list.add(arglist.name)
 
     default_formatting = True
     default_constraint = True
@@ -102,10 +117,13 @@ def main() -> None:
         m = re.match(r"([\d.]*)@([\w.]+)", i)
         if m:
             # looks like a jobsub id 12.34@schedd.name
-            schedd = m.group(2)
-            i = m.group(1)
-            if not i:
-                continue
+            match_jobid, match_schedd = m.groups()
+            schedd_list.add(match_schedd)
+            if match_jobid:
+                jobid = match_jobid.strip(".")
+                args_for_schedd[match_schedd].append(jobid)
+            continue
+
         # convert --better-analyze to -better-analyze, etc.
         if i.startswith("--"):
             i = i[1:]
@@ -116,6 +134,7 @@ def main() -> None:
             "-better-analyze",
             "-dag",
             "-format",
+            "-hold",
             "-io",
             "-json",
             "-long",
@@ -139,12 +158,6 @@ def main() -> None:
             default_constraint = False
 
         execargs.append(i)
-
-    if schedd:
-        execargs.insert(0, schedd)
-        execargs.insert(0, "-name")
-        if not os.getenv("_condor_CREDD_HOST", False):
-            os.environ["_condor_CREDD_HOST"] = schedd
 
     # also make sure we have suitable credentials...
     role = fake_ifdh.getRole(arglist.role)
@@ -215,14 +228,46 @@ def main() -> None:
                 "JOBSUBJOBID                             OWNER       \tSUBMITTED     RUNTIME"
                 "   ST PRIO   SIZE  COMMAND"
             )
+            sys.stdout.flush()
+
+            # pipe our remaining output through sort (by date) and jobsub_totals next to us
+            jobsub_totals_path = os.path.join(
+                os.path.dirname(__file__), "jobsub_totals"
+            )
+            totalsf = os.popen(f"sort -k 3,4 | {jobsub_totals_path}", "w")
+            os.close(1)
+            os.dup2(totalsf.fileno(), 1)
 
     cmd = cmd.replace("jobsub_", "condor_")
 
-    execargs.insert(0, cmd)
+    if not schedd_list:
+        # if no specific schedds given, get list of all...
+        schedd_list = set(condor.get_schedd_names(vars(arglist)))
 
-    # now run the command with those arguments
-    os.execvp("/usr/bin/" + cmd, execargs)
+    if verbose:
+        print("schedd list:", schedd_list)
+
+    for schedd in schedd_list:
+        os.environ["_condor_CREDD_HOST"] = schedd
+        these_args = [cmd, "-name", schedd] + execargs + args_for_schedd.get(schedd, [])
+        if verbose:
+            print("running:", these_args)
+        pid = os.fork()
+        if pid:
+            os.wait()
+        else:
+            os.execvp("/usr/bin/" + cmd, these_args)
+
+    if default_formatting:
+        os.close(1)
+        totalsf.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if verbose:
+            raise
+        sys.stderr.write(f"\n\nError: {e.__class__.__name__}: {str(e)}\n\n")
+        sys.exit(1)

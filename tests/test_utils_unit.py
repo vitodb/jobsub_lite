@@ -1,3 +1,5 @@
+from collections import namedtuple
+import json
 import os
 import sys
 import tempfile
@@ -23,8 +25,8 @@ else:
 import utils
 
 from test_unit import TestUnit
-from test_creds_unit import needs_credentials  # pylint: disable=unused-import
-from test_creds_unit import clear_x509_user_proxy  # pylint: disable=unused-import
+
+DATADIR = f"{os.path.abspath(os.path.dirname(__file__))}/data"
 
 
 def fill_in(dir):
@@ -54,6 +56,84 @@ def test_old_dir(test_job_dir):
     return test_job_dir
 
 
+def site_and_usage_model_test_data():
+    """Pull in site and usage model test data from data file and
+    return a list of test data for use in test"""
+    SiteAndUsageModelTestCase = namedtuple(
+        "SiteAndUsageModelTestCase",
+        [
+            "sites",
+            "usage_model",
+            "resource_provides_quoted",
+            "expected_result",
+            "helptext",
+        ],
+    )
+    DATA_FILENAME = "site_and_usagemodel.json"
+    with open(f"{DATADIR}/{DATA_FILENAME}", "r") as datafile:
+        tests_json = json.load(datafile)
+
+    return [
+        SiteAndUsageModelTestCase(
+            sites=test_json["sites"],
+            usage_model=test_json["usage_model"],
+            resource_provides_quoted=test_json["resource_provides_quoted"],
+            expected_result=(
+                utils.SiteAndUsageModel(
+                    **test_json["expected_result"]["site_and_usage_model"]
+                ),
+                test_json["expected_result"]["resource_provides_remainder"],
+            ),
+            helptext=test_json["helptext"],
+        )
+        for test_json in tests_json
+    ]
+
+
+def singularity_test_data():
+    """Pull in singularity test data from data file and return a list of
+    test cases"""
+    SingularityTestCase = namedtuple(
+        "SingularityTestCase",
+        [
+            "singularity_image_arg",
+            "lines_arg",
+            "expected_singularity_image",
+            "expected_lines",
+            "helptext",
+        ],
+    )
+
+    DATA_FILENAME = "singularity_image.json"
+    with open(f"{DATADIR}/{DATA_FILENAME}", "r") as datafile:
+        tests_json = json.load(datafile)
+
+    return [SingularityTestCase(**test_json) for test_json in tests_json]
+
+
+def site_blacklist_test_data(good=True):
+    """Pull in site/blacklist test data from data file and return a list of
+    test cases"""
+    SiteAndBlacklistTestData = namedtuple(
+        "SiteAndBlacklistTestData", ["helptext", "site_arg", "blacklist_arg"]
+    )
+    good_or_bad = "good" if good else "bad"
+    DATA_FILENAME = f"site_blacklist_{good_or_bad}.json"
+    with open(f"{DATADIR}/{DATA_FILENAME}", "r") as datafile:
+        tests_json = json.load(datafile)
+
+    return [SiteAndBlacklistTestData(**test_json) for test_json in tests_json]
+
+
+def create_id_for_test_case(value) -> str:
+    """Creates test IDs for our TestCase classes (namedtuples).  Will return
+    the "helptext" attribute of the TestCase if it exists"""
+    try:
+        return value.helptext
+    except AttributeError:
+        pass
+
+
 class TestUtilsUnit:
     """
     Use with pytest... unit tests for ../lib/*.py
@@ -74,7 +154,7 @@ class TestUtilsUnit:
     def test_grep_n_1(self):
         """check the grep_n routine on us"""
         assert utils.grep_n(r"class (\w*):", 1, __file__) == "TestUtilsUnit"
-        assert utils.grep_n(r"import (\w*)", 1, __file__) == "os"
+        assert utils.grep_n(r"import (\w*)", 1, __file__) == "json"
 
     @pytest.mark.unit
     def test_fix_unit_1(self):
@@ -170,231 +250,25 @@ class TestUtilsUnit:
         assert os.path.exists(f"{newd}/simple.cmd")
 
     @pytest.mark.unit
-    def test_resolve_site_and_usage_model(self):
-        _should_work = [
-            # no flags
-            (
-                "",
-                "DEDICATED,OPPORTUNISTIC,OFFSITE",
-                [],
-                (
-                    utils.SiteAndUsageModel("", "DEDICATED,OPPORTUNISTIC,OFFSITE"),
-                    [],
-                ),
-            ),
-            # --onsite
-            (
-                "",
-                "DEDICATED,OPPORTUNISTIC",
-                [],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    [],
-                ),
-            ),
-            # --site Fermigrid
-            (
-                utils.ONSITE_SITE_NAME,
-                "",
-                [],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    [],
-                ),
-            ),
-            # --site Random_Site
-            (
-                "Random_Site",
-                "",
-                [],
-                (
-                    utils.SiteAndUsageModel("Random_Site", "OFFSITE"),
-                    [],
-                ),
-            ),
-            # --offsite
-            (
-                "",
-                "OFFSITE",
-                [],
-                (
-                    utils.SiteAndUsageModel("", "OFFSITE"),
-                    [],
-                ),
-            ),
-            # --resource-provides=usage_model=DEDICATED,OFFSITE
-            (
-                "",
-                "",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel("", ""),
-                    ['usage_model="DEDICATED,OFFSITE"'],
-                ),
-            ),
-            # --resource-provides=usage_model=DEDICATED,OFFSITE --site Fermigrid
-            (
-                utils.ONSITE_SITE_NAME,
-                "",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    [],
-                ),
-            ),
-            # --resource-provides=usage_model=DEDICATED,OFFSITE --site Random_Site
-            (
-                "Random_Site",
-                "",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel("Random_Site", "OFFSITE"),
-                    [],
-                ),
-            ),
-            # --site=Fermigrid,Random_Site --resource-provides=usage_model=DEDICATED,OFFSITE
-            (
-                f"{utils.ONSITE_SITE_NAME},Random_Site",
-                "",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel(
-                        f"{utils.ONSITE_SITE_NAME},Random_Site",
-                        "DEDICATED,OPPORTUNISTIC,OFFSITE",
-                    ),
-                    [],
-                ),
-            ),
-            # --site=Fermigrid,Random_Site
-            (
-                f"{utils.ONSITE_SITE_NAME},Random_Site",
-                "",
-                [],
-                (
-                    utils.SiteAndUsageModel(
-                        f"{utils.ONSITE_SITE_NAME},Random_Site",
-                        "DEDICATED,OPPORTUNISTIC,OFFSITE",
-                    ),
-                    [],
-                ),
-            ),
-            # --site=Fermigrid,Random_Site --resource_provides=usage_model=DEDICATED,OFFSITE --resource-provides=IWANT=this_resource
-            (
-                f"{utils.ONSITE_SITE_NAME},Random_Site",
-                "",
-                ['usage_model="DEDICATED,OFFSITE"', 'IWANT="this_resource"'],
-                (
-                    utils.SiteAndUsageModel(
-                        f"{utils.ONSITE_SITE_NAME},Random_Site",
-                        "DEDICATED,OPPORTUNISTIC,OFFSITE",
-                    ),
-                    ['IWANT="this_resource"'],
-                ),
-            ),
-            # --onsite --resource_provides=usage_model=DEDICATED,OFFSITE --resource-provides=IWANT=this_resource
-            (
-                "",
-                "DEDICATED,OPPORTUNISTIC",
-                ['usage_model="DEDICATED,OFFSITE"', 'IWANT="this_resource"'],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    ['IWANT="this_resource"'],
-                ),
-            ),
-            # --onsite --resource_provides=usage_model=DEDICATED,OFFSITE
-            (
-                "",
-                "DEDICATED,OPPORTUNISTIC",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    [],
-                ),
-            ),
-            # --resource_provides=usage_model=DEDICATED,OPPORTUNISTIC --site Random_Site
-            (
-                "Random_Site",
-                "",
-                ['usage_model="DEDICATED,OPPORTUNISTIC"'],
-                (
-                    utils.SiteAndUsageModel("Random_Site", "OFFSITE"),
-                    [],
-                ),
-            ),
-            # --resource-provides=usage_model=DEDICATED --site Random_Site
-            (
-                "Random_Site",
-                "",
-                ['usage_model="DEDICATED"'],
-                (
-                    utils.SiteAndUsageModel("Random_Site", "OFFSITE"),
-                    [],
-                ),
-            ),
-            # --resource-provides=usage_model=OFFSITE --site Fermigrid
-            (
-                utils.ONSITE_SITE_NAME,
-                "",
-                ['usage_model="OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    [],
-                ),
-            ),
-            # --site=Random_Site_1,Random_Site_2 --resource-provides=usage_model=DEDICATED,OFFSITE
-            (
-                "Random_Site_1,Random_Site_2",
-                "",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel("Random_Site_1,Random_Site_2", "OFFSITE"),
-                    [],
-                ),
-            ),
-            # --onsite --resource-provides=usage_model=DEDICATED,OFFSITE
-            (
-                "",
-                "DEDICATED,OPPORTUNISTIC",
-                ['usage_model="DEDICATED,OFFSITE"'],
-                (
-                    utils.SiteAndUsageModel(
-                        utils.ONSITE_SITE_NAME, "DEDICATED,OPPORTUNISTIC"
-                    ),
-                    [],
-                ),
-            ),
-            # --offsite --resource-provides=usage_model=DEDICATED
-            (
-                "",
-                "OFFSITE",
-                ['usage_model="DEDICATED"'],
-                (
-                    utils.SiteAndUsageModel("", "OFFSITE"),
-                    [],
-                ),
-            ),
-        ]
-
-        for (sites, usage_model, resource_provides_quoted, expected) in _should_work:
-            assert (
-                utils.resolve_site_and_usage_model(
-                    sites, usage_model, resource_provides_quoted
-                )
-                == expected
+    @pytest.mark.parametrize(
+        "site_and_usage_model_test_case",
+        site_and_usage_model_test_data(),
+        ids=create_id_for_test_case,
+    )
+    def test_resolve_site_and_usage_model(self, site_and_usage_model_test_case):
+        """Check that site, usage model, and resource provides inputs are resolved
+        correctly"""
+        assert (
+            utils.resolve_site_and_usage_model(
+                site_and_usage_model_test_case.sites,
+                site_and_usage_model_test_case.usage_model,
+                site_and_usage_model_test_case.resource_provides_quoted,
             )
+            == site_and_usage_model_test_case.expected_result
+        )
 
+    @pytest.mark.unit
+    def test_resolve_site_and_usage_model_invalid(self):
         # I honestly can't think of any combos that don't work/won't get corrected before we get to validation,
         # but I'm leaving this here unless I missed something
         _should_not_work = []
@@ -405,3 +279,52 @@ class TestUtilsUnit:
                 utils.resolve_site_and_usage_model(
                     sites, usage_model, resource_provides_quoted
                 )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "singularity_test_case",
+        singularity_test_data(),
+        ids=create_id_for_test_case,
+    )
+    def test_resolve_singularity_image(self, singularity_test_case):
+        """Test to make sure that given simgularity image and lines arguments are handled
+        correctly"""
+        assert (
+            singularity_test_case.expected_singularity_image,
+            singularity_test_case.expected_lines,
+        ) == utils.resolve_singularity_image(
+            singularity_test_case.singularity_image_arg,
+            singularity_test_case.lines_arg,
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "site_blacklist_test_case",
+        site_blacklist_test_data(good=True),
+        ids=create_id_for_test_case,
+    )
+    def test_check_site_and_blacklist_good(self, site_blacklist_test_case):
+        """Test to make sure that a given comma-separated site list string
+        and blacklist string are handled correctly"""
+        assert (
+            utils.check_site_and_blacklist(
+                site_blacklist_test_case.site_arg,
+                site_blacklist_test_case.blacklist_arg,
+            )
+            is None
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "site_blacklist_test_case",
+        site_blacklist_test_data(good=False),
+        ids=create_id_for_test_case,
+    )
+    def test_check_site_and_blacklist_bad(self, site_blacklist_test_case):
+        """Test to make sure that a given comma-separated site list string
+        and blacklist string are handled correctly"""
+        with pytest.raises(utils.SiteAndBlacklistConflictError):
+            utils.check_site_and_blacklist(
+                site_blacklist_test_case.site_arg,
+                site_blacklist_test_case.blacklist_arg,
+            )

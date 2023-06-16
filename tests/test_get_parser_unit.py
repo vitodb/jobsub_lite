@@ -18,9 +18,25 @@ if os.environ.get("JOBSUB_TEST_INSTALLED", "0") == "1":
 else:
     sys.path.append("../lib")
 
+from condor import get_schedd_names
 import get_parser
+import pool
 
 from test_unit import TestUnit
+from test_submit_wait_int import get_collector
+
+
+def set_pool_map():
+    """we need a pool map set to test the --global-pool option"""
+    os.environ["GROUP"] = "dune"
+    os.environ["JOBSUB_POOL_MAP"] = (
+        '{"dune":{"collector":"' + get_collector() + '","onsite":"FNAL_GPGRID"}}'
+    )
+    del os.environ["GROUP"]
+
+
+# we need to set the pool map when we're imported...
+set_pool_map()
 
 
 @pytest.fixture
@@ -127,11 +143,16 @@ def all_test_args():
         "xxblacklistxx",
         "--cmtconfig",
         "xxcmtconfigxx",
+        "--constraint",
         "--cpu",
         "xxcpuxx",
         "--dag",
         "--dataset-definition",
         "xxdataset-definitionxx",
+        "--dd-percentage",
+        "50",
+        "--dd-extra-dataset",
+        "xxdd-extra-datasetxx",
         "--debug",
         "--disk",
         "xxdiskxx",
@@ -147,8 +168,12 @@ def all_test_args():
         "-f",
         "xxfxx",
         "--generate-email-summary",
+        "--global-pool",
+        "dune",
         "--group",
         "xxgroupxx",
+        "--job-info",
+        "xxjob-infoxx",
         "--jobid",
         "--log-file",
         "xxlog-filexx",
@@ -182,8 +207,10 @@ def all_test_args():
         "--singularity-image",
         "xxsingularity-imagexx",
         "--apptainer-image",
+        "--schedd-for-testing",
         "--site",
         "xxsitexx",
+        "--skip-check",
         "--subgroup",
         "xxsubgroupxx",
         "--support-email",
@@ -209,6 +236,52 @@ def all_test_args():
         "xx_executable_arg_2_xx",
         "xx_executable_arg_3_xx",
     ]
+
+
+@pytest.fixture
+def clear_group_from_environment():
+    """This fixture clears out the group environment variable"""
+    old_group = os.environ.get("GROUP", None)
+    if old_group:
+        del os.environ["GROUP"]
+    yield
+    os.environ["GROUP"] = old_group
+
+
+@pytest.fixture
+def skip_check_arg_parser():
+    """This fixture sets up a lightweight ArgumentParser to test the --skip-check flag"""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--skip-check", type=str, default=[], action=get_parser.VerifyAndAddSkipCheck
+    )
+    return parser
+
+
+@pytest.fixture
+def get_single_valid_check_to_skip():
+    """This fixture gets a valid check from the skip_checks module to set up for tests"""
+    from skip_checks import SupportedSkipChecks
+
+    valid_check: str = ""
+    valid_checks = SupportedSkipChecks.get_all_checks()
+    if len(valid_checks) > 0:
+        valid_check = valid_checks[0]
+    return valid_check
+
+
+@pytest.fixture
+def schedd_for_testing_arg_parser():
+    """This fixture sets up a lightweight ArgumentParser to test the --schedd-for-testing flag"""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--schedd-for-testing", type=str, action=get_parser.CheckIfValidSchedd
+    )
+    return parser
 
 
 class TestGetParserUnit:
@@ -281,6 +354,9 @@ class TestGetParserUnit:
             "--offsite-only",
             "--offsite",
             "--jobid",
+            "--constraint",
+            "--skip-check",  # Skipping this one because we do a special test later on for this
+            "--schedd-for-testing",  # Skipping this one because we do a special test later on for this
         ]
 
         def filter_excluded(arg_list):
@@ -328,9 +404,13 @@ class TestGetParserUnit:
                 assert vres["verbose"] == 1
             elif arg == "dataset":
                 assert vres["dataset_definition"] == "xxdataset-definitionxx"
+            elif arg == "global-pool":
+                assert vres["global_pool"] == "dune"
+            elif arg == "dd-percentage":
+                assert vres["dd_percentage"] == 50
             elif arg in listargs:
                 # args are in a list, so look for list containing xxflagxx
-                if arg in ["resource-provides", "lines"]:
+                if arg in ["lines"]:
                     # some of our arguments start with blank in the list
                     # so a "\nprefix:".join(list) prefixes the useful items
                     assert vres[uarg] == [
@@ -350,9 +430,92 @@ class TestGetParserUnit:
         for i in range(4):
             assert "xx_executable_arg_%s_xx" % i in vres["exe_arguments"]
 
+    @pytest.mark.unit
     def test_get_condor_epilog(self):
         """make sure we get the condor_q help epilog if we are jobsub_q"""
         sys.argv[0] = "/blah/blah/jobsub_q"
         epilog = get_parser.get_condor_epilog()
         assert epilog.find("also condor_q arguments") == 0
         assert epilog.find("-better-analyze") > 0
+
+    @pytest.mark.unit
+    def test_verify_and_add_skip_check_valid(
+        self, skip_check_arg_parser, get_single_valid_check_to_skip
+    ):
+        """This test checks that when we pass a valid check to --skip-check,
+        the attributes are set correctly in the ArgumentParser namespace
+        """
+        valid_check = get_single_valid_check_to_skip
+        if not valid_check:
+            return
+
+        args = skip_check_arg_parser.parse_args(["--skip-check", valid_check])
+        assert valid_check in args.skip_check
+        assert getattr(args, f"skip_check_{valid_check}", False)
+
+    @pytest.mark.unit
+    def test_verify_and_add_skip_check_duplicate(
+        self, skip_check_arg_parser, get_single_valid_check_to_skip
+    ):
+        """This test checks that if we pass a duplicate valid check to --skip-check,
+        the ArgumentParser namespace attributes are set correctly, and we only see
+        the check once in the ArgumentParser namespace"""
+        valid_check = get_single_valid_check_to_skip
+        if not valid_check:
+            return
+
+        args = skip_check_arg_parser.parse_args(
+            ["--skip-check", valid_check, "--skip-check", valid_check]
+        )
+        assert valid_check in args.skip_check
+        assert len(args.skip_check) == 1
+        assert getattr(args, f"skip_check_{valid_check}", False)
+
+    @pytest.mark.unit
+    def test_verify_and_add_skip_check_single_invalid(self, skip_check_arg_parser):
+        """This test makes sure that if we pass an invalid check to --skip-check, we
+        get a TypeError"""
+        with pytest.raises(TypeError, match="Invalid argument to flag --skip-check:"):
+            skip_check_arg_parser.parse_args(["--skip-check", "ThisIsAFakeCheck"])
+
+    @pytest.mark.unit
+    def test_verify_and_add_skip_check_mixed_invalid(
+        self, skip_check_arg_parser, get_single_valid_check_to_skip
+    ):
+        """This test makes sure that if we pass a mix of valid and invalid checks
+        to --skip-check, we still get a TypeError"""
+        valid_check = get_single_valid_check_to_skip
+        if not valid_check:
+            return
+
+        with pytest.raises(TypeError, match="Invalid argument to flag --skip-check:"):
+            skip_check_arg_parser.parse_args(
+                ["--skip-check", valid_check, "--skip-check", "ThisIsAFakeCheck"]
+            )
+
+    @pytest.mark.unit
+    def test_put_back_pool(self):
+        pool.reset_pool()
+
+    @pytest.mark.unit
+    def test_schedd_for_testing_valid(
+        self, clear_group_from_environment, schedd_for_testing_arg_parser
+    ):
+        """This test ensures that if we give a valid schedd to --schedd-for-testing,
+        we are allowed to proceed"""
+        schedds = get_schedd_names({})
+        valid_schedd = schedds[0]
+
+        args = schedd_for_testing_arg_parser.parse_args(
+            ["--schedd-for-testing", valid_schedd]
+        )
+        assert args.schedd_for_testing == valid_schedd
+
+    @pytest.mark.unit
+    def test_schedd_for_testing_invalid(self, schedd_for_testing_arg_parser):
+        """This test makes sure that if we give an invalid schedd to --schedd-for-testing,
+        we get a TypeError"""
+        with pytest.raises(TypeError, match="Invalid schedd specified"):
+            schedd_for_testing_arg_parser.parse_args(
+                ["--schedd-for-testing", "this_is_an_invalid_schedd.domain"]
+            )

@@ -7,9 +7,6 @@
 
 umask 002
 
-# add a link of our original name
-ln $0 {{script_name|default('simple.sh')}}
-
 {% if not no_env_cleanup %}
 #
 # clear out variables that sometimes bleed into containers
@@ -21,13 +18,21 @@ do
 done
 {% endif %}
 
+if grep -q release.6 /etc/system-release
+then
+    : tokens do not work on SL6...
+    unset BEARER_TOKEN_FILE
+else
+
 {% if role is defined and role and role != 'Analysis' %}
-#export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}_{{role | lower}}_{{oauth_handle}}.use
-export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}_{{role | lower}}.use
+export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}_{{role | lower}}_{{oauth_handle}}.use
+#export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}_{{role | lower}}.use
 {% else %}
-#export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}_{{oauth_handle}}.use
-export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}.use
+export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}_{{oauth_handle}}.use
+#export BEARER_TOKEN_FILE=$PWD/.condor_creds/{{group}}.use
 {% endif %}
+
+fi
 
 set_jobsub_debug(){
     export PS4='$LINENO:'
@@ -84,7 +89,7 @@ jobsub_truncate() {
             export JSB_TMP=/tmp/$$
         mkdir -p $JSB_TMP
     fi
-    JSB_OUT=$JSB_TMP/truncated
+    JSB_OUT=$1.truncated
     if [ $JOBSUB_LOG_SIZE -gt $JOBSUB_MAX_JOBLOG_SIZE ]; then
         head -c $JOBSUB_MAX_JOBLOG_HEAD_SIZE $1 > $JSB_OUT
         echo "
@@ -98,7 +103,6 @@ jobsub:---- resumed for last $JOBSUB_MAX_JOBLOG_TAIL_SIZE bytes--
         cp $1 $JSB_OUT
     fi
     cat $JSB_OUT
-    rm $JSB_OUT
 }
 
 
@@ -114,6 +118,11 @@ redirect_output_finish(){
     exec 2>&8 8>&-
     jobsub_truncate ${JSB_TMP}/JOBSUB_ERR_FILE 1>&2
     jobsub_truncate ${JSB_TMP}/JOBSUB_LOG_FILE
+    {%if outurl%}
+    {% set filebase %}{{executable|basename}}{{datetime}}{{uuid}}cluster.$CLUSTER.$PROCESS{% endset %}
+    IFDH_CP_MAXRETRIES=1 ${JSB_TMP}/ifdh.sh cp ${JSB_TMP}/JOBSUB_ERR_FILE.truncated {{outurl}}/{{filebase}}.err
+    IFDH_CP_MAXRETRIES=1 ${JSB_TMP}/ifdh.sh cp ${JSB_TMP}/JOBSUB_LOG_FILE.truncated {{outurl}}/{{filebase}}.out
+    {%endif%}
 }
 
 
@@ -209,49 +218,95 @@ export PATH="${PATH}:."
 
 # -f files for input
 {%for fname in input_file%}
-${JSB_TMP}/ifdh.sh cp -D {{fname}} ${CONDOR_DIR_INPUT}
+  {%if fname[:6] == "/cvmfs" and "fifeuser" in fname%}
+    # RCDS unpacked tarfile
+    # Save tfname into a list in case we couldn't get the exact path, like if user skipped the RCDS upload check
+    fnamelist=({{fname}})
+
+    # Given 40 tries, with a sleep of 30 seconds, we retry for a maximum of around 20 minutes PER item in fnamelist
+    num_tries=0
+    max_tries=40
+    slp=30
+
+    # wait for RCDS file to show up.  We check all possible locations each try
+    num_tries=0
+    while [ ${num_tries} -lt ${max_tries} ]; do
+      num_tries=$(($num_tries + 1))
+      fnamelist=( `shuf -e "${fnamelist[@]}"` ) # Shuffle our list
+      for candidate_fname in ${fnamelist[@]}; do
+        echo "Looking for file ${candidate_fname} on RCDS.  Try ${num_tries} of ${max_tries}"
+        if test -f "${candidate_fname}"; then
+            echo "Found file ${candidate_fname} on RCDS.  Copying in."
+            ${JSB_TMP}/ifdh.sh cp -D ${candidate_fname} ${CONDOR_DIR_INPUT}
+            break 2 # Break out of both candidate_fname and retry loop
+        fi
+      done
+      if [[ $num_tries -eq $max_tries ]]; then
+        echo "Max retries ${num_tries} exceeded to find ${candidate_fname} on RCDS.  Exiting now."
+        exit 1 # Fail the job right here
+      fi
+      sleep $slp
+    done
+  {%else%}
+    ${JSB_TMP}/ifdh.sh cp -D {{fname}} ${CONDOR_DIR_INPUT}
+    chmod u+x ${CONDOR_DIR_INPUT}/{{fname|basename}}
+  {%endif%}
 {%endfor%}
 
 # --tar_file_name for input
 {%for tfname in tar_file_name%}
   {%if tfname[:6] == "/cvmfs" and tfname[-7:] != ".tar.gz" %}
     # RCDS unpacked tarfile
-    {%if loop.first%}
-      INPUT_TAR_DIR_LOCAL={{tfname}}
-      export INPUT_TAR_DIR_LOCAL
-      # Note: this filename doesn't exist, but if you take dirname
-      #       of it you find the contents
-      INPUT_TAR_FILE={{tfname}}/{{tar_file_orig_basenames[loop.index0]}}.tar
-      export INPUT_TAR_FILE
-      ln -s {{tfname}} ${CONDOR_DIR_INPUT}/{{tar_file_orig_basenames[loop.index0]}}
+    # Save tfname into a list in case we couldn't get the exact path, like if user skipped the RCDS upload check
+    tfnamelist=({{tfname}})
 
-      # wait for tarfile to show up
-      num_tries=0
-      max_tries=30
-      slp=30
-      while [ $num_tries -lt $max_tries ]; do
-           num_tries=$(($num_tries + 1))
-           if  test -d "$INPUT_TAR_DIR_LOCAL" ; then
-               break
-           else
-               sleep $slp
-           fi
+    # Given 40 tries, with a sleep of 30 seconds, we retry for a maximum of around 20 minutes PER item in tfnamelist
+    num_tries=0
+    max_tries=40
+    slp=30
+
+    # wait for tarfile to show up
+    while [[ ${num_tries} -lt ${max_tries} ]]; do
+      num_tries=$(($num_tries + 1))
+      tfnamelist=( `shuf -e "${tfnamelist[@]}"` ) # Shuffle our list
+      for candidate_tfname in ${tfnamelist[@]}; do
+        echo "Looking for directory ${candidate_tfname} on RCDS.  Try ${num_tries} of ${max_tries}"
+        if test -d "${candidate_tfname}" ; then
+          # found the tarfile.  Set the environment variables
+          echo "Found file ${candidate_tfname} on RCDS.  Setting environment variables and links in job."
+          {%if loop.first%}
+            INPUT_TAR_DIR_LOCAL=${candidate_tfname}
+            export INPUT_TAR_DIR_LOCAL
+            # Note: this filename doesn't exist, but if you take dirname
+            #       of it you find the contents
+            INPUT_TAR_FILE=${candidate_tfname}/{{tar_file_orig_basenames[loop.index0]}}.tar
+            export INPUT_TAR_FILE
+            ln -s ${candidate_tfname} ${CONDOR_DIR_INPUT}/{{tar_file_orig_basenames[loop.index0]}}
+            break 2 # Break out of both candidate_tfname and retry loop
+          {%else%}
+            INPUT_TAR_DIR_LOCAL_{{loop.index0}}=${candidate_tfname}
+            export INPUT_TAR_DIR_LOCAL_{{loop.index0}}
+            # Note: this filename doesn't exist, but if you take dirname
+            #       of it you find the contents
+            INPUT_TAR_FILE_{{loop.index0}}=${candidate_tfname}/{{tar_file_orig_basenames[loop.index0]}}.tar
+            export INPUT_TAR_FILE_{{loop.index0}}
+            ln -s ${candidate_tfname} ${CONDOR_DIR_INPUT}/{{tar_file_orig_basenames[loop.index0]}}
+            break 2 # Break out of both candidate_tfname and retry loop
+          {%endif%}
+        fi
       done
-    {%else%}
-      INPUT_TAR_DIR_LOCAL_{{loop.index0}}={{tfname}}
-      export INPUT_TAR_DIR_LOCAL_{{loop.index0}}
-      # Note: this filename doesn't exist, but if you take dirname
-      #       of it you find the contents
-      INPUT_TAR_FILE_{{loop.index0}}={{tfname}}/{{tar_file_orig_basenames[loop.index0]}}.tar
-      export INPUT_TAR_FILE_{{loop.index0}}
-      ln -s {{tfname}} ${CONDOR_DIR_INPUT}/{{tar_file_orig_basenames[loop.index0]}}
-    {%endif%}
+      if [[ $num_tries -eq $max_tries ]] ; then
+        echo "Max retries ${num_tries} exceeded to find ${candidate_tfname}.  Exiting."
+        exit 1 # Fail the job right here
+      fi
+      sleep $slp
+    done
   {%else%}
     # tarfile to transfer and unpack
     mkdir .unwind_{{loop.index0}}
     {%set tflocal = '.unwind_%d/%s' % (loop.index0, tfname|basename) %}
     ${JSB_TMP}/ifdh.sh cp {{tfname}} {{tflocal}}
-    tar --directory .unwind_{{loop.index0}} -xzvf {{tflocal}}
+    tar --directory .unwind_{{loop.index0}} -xjvf {{tflocal}}
     {%if loop.first%}
       INPUT_TAR_DIR_LOCAL=`pwd`/.unwind_{{loop.index0}}
       export INPUT_TAR_DIR_LOCAL
@@ -270,8 +325,8 @@ ${JSB_TMP}/ifdh.sh cp -D {{fname}} ${CONDOR_DIR_INPUT}
 
 # -d directories for output
 {%for pair in d%}
-export JOBSUB_OUT_{{pair[0]}}=out_{{pair[0]}}
-mkdir $JOBSUB_OUT_{{pair[0]}}
+export CONDOR_DIR_{{pair[0]}}=`pwd`/out_{{pair[0]}}
+mkdir $CONDOR_DIR_{{pair[0]}}
 {%endfor%}
 
 # ==========
@@ -326,7 +381,7 @@ mkdir $JOBSUB_OUT_{{pair[0]}}
 {%elif group == 'minerva' %}
   # Minerva preamble
   {%if i%}
-    source {{i}}/setup.sh -c {{r}} {{cmtconfig}}
+    source {{i}}/setup.sh -c {{cmtconfig}}
     {%if t%}
       pushd {{t}}/cmt
       cmt config
@@ -367,12 +422,17 @@ ${JSB_TMP}/ifdh.sh log poms_data=$poms_data
 echo `date` $JOBSUBJOBID BEGIN EXECUTION $JOBSUB_EXE_SCRIPT {{exe_arguments|join(" ")}} >&2
 echo `date` $JOBSUBJOBID BEGIN EXECUTION $JOBSUB_EXE_SCRIPT {{exe_arguments|join(" ")}}
 
-{%if timeout is defined and timeout %} timeout {{timeout}} {%endif%} $JOBSUB_EXE_SCRIPT {{exe_arguments|join(" ")}}
+{%if timeout is defined and timeout %} timeout {{timeout}} {%endif%} $JOBSUB_EXE_SCRIPT {{exe_arguments|join(" ")}} {%if log_file is defined and log_file %}> _joblogfile 2>&1 {% endif %}
 JOB_RET_STATUS=$?
+
+# copy out job log file
+{%if log_file is defined and log_file %}
+${JSB_TMP}/ifdh.sh cp _joblogfile {{log_file}}
+{%endif%}
 
 # copy out -d directories
 {%for pair in d%}
-${JSB_TMP}/ifdh.sh cp -D $JOBSUB_OUT_{{pair[0]}}/* {{pair[1]}}
+${JSB_TMP}/ifdh.sh cp -D $CONDOR_DIR_{{pair[0]}}/* {{pair[1]}}
 {%endfor%}
 
 echo `date` $JOBSUB_EXE_SCRIPT COMPLETED with exit status $JOB_RET_STATUS

@@ -19,83 +19,203 @@ import sys
 import glob
 import re
 import random
+import shutil
 import subprocess
-from typing import Dict, List, Any, Tuple, Optional, Union
+from contextlib import contextmanager
+from typing import Dict, List, Any, Tuple, Optional, Union, Generator
 
 import htcondor  # type: ignore
+import jinja2  # type: ignore
 import classad  # type: ignore
 
 import packages
+import fake_ifdh
 
 random.seed()
 
 # pylint: disable-next=no-member
 COLLECTOR_HOST = htcondor.param.get("COLLECTOR_HOST", None)
 
+# Global dict to hold onto schedd ads so we only have to query schedd once
+# This should ONLY be changed by get_schedd_list
+__schedd_ads: Dict[str, classad.ClassAd] = {}
+
+
+@contextmanager
+def submit_vt(
+    vo: str, role: str, schedd: str, verbose: int
+) -> Generator[None, None, None]:
+
+    """
+    Rearrange vaulttoken files around a submit
+    Rename them to keep timestamps, etc.
+    """
+    try:
+        tmp = os.environ.get("TMPDIR", "/tmp")
+        uid = os.getuid()
+        pid = os.getpid()
+        if verbose > 1:
+            print("vault tokens before pre-submit renaming:")
+            os.system(f"ls -l {tmp}/vt_u{uid}*")
+        schedvtname = f"{tmp}/vt_u{uid}-{schedd}-{vo}_{role}"
+        if role != fake_ifdh.DEFAULT_ROLE:
+            vtname = f"{tmp}/vt_u{uid}-{vo}_{role}"
+        else:
+            vtname = f"{tmp}/vt_u{uid}-{vo}"
+        plainvtname = f"{tmp}/vt_u{uid}"
+
+        if os.path.exists(vtname) and not os.access(vtname, os.W_OK):
+            if verbose > 1:
+                print("Not doing vault token renaming: readonly vault token")
+        else:
+            if os.path.exists(schedvtname):
+                if verbose > 0:
+                    print(f"moving in saved vaulttoken {schedvtname}")
+
+                if os.path.exists(vtname):
+                    os.rename(vtname, f"{vtname}.{pid}")
+                os.rename(schedvtname, vtname)
+
+            if verbose > 1:
+                print("vault tokens after pre-submit renaming:")
+                os.system(f"ls -l {tmp}/vt_u{uid}*")
+
+        yield None
+
+    finally:
+
+        if os.path.exists(vtname) and not os.access(vtname, os.W_OK):
+            if verbose > 1:
+                print("Not doing vault token renaming: readonly vault token")
+        else:
+            if os.path.exists(vtname):
+                if verbose > 0:
+                    print(f"saving vaulttoken as {schedvtname}")
+                os.rename(vtname, schedvtname)
+
+            # if we saved a vaulttokenfile earlier, put it back,
+            if os.path.exists(f"{vtname}.{pid}"):
+                os.rename(f"{vtname}.{pid}", vtname)
+
+            if verbose > 1:
+                print("vault tokens after post-submit renaming:")
+                os.system(f"ls -l {tmp}/vt_u{uid}*")
+
 
 # pylint: disable-next=no-member
-def get_schedd(vargs: Dict[str, Any]) -> classad.ClassAd:
-    """get jobsub* schedd names from collector, pick one."""
+def get_schedd_list(
+    vargs: Dict[str, Any], refresh_schedd_ads: bool = False
+) -> List[classad.ClassAd]:
+    """
+    Get jobsub* schedd classads from collector.  Also, populate the in-memory store of the schedd
+    classads
+    """
+    global __schedd_ads
+
+    # First, try to load schedd ads from memory
+    if __schedd_ads and not refresh_schedd_ads:
+        if vargs.get("verbose", 0) > 1:
+            print("\nUsing cached schedd ads - NOT querying condor collector\n")
+        return [ad for ad in __schedd_ads.values()]
+
+    # If schedd ads not in memory or refresh_schedd_ads is True, go ahead and get the classads from the collector
+    if vargs.get("verbose", 0) > 1:
+        print(f"\nQuerying condor collector {COLLECTOR_HOST} for schedd ads\n")
+
+    # Constraint setup
+    constraint = (
+        "IsJobsubLite=?=true"
+        '{% if group is defined and group %} && STRINGLISTIMEMBER("{{group}}", SupportedVOList){% endif %}'
+        '{% if schedd_for_testing is defined and schedd_for_testing %} && Name == "{{schedd_for_testing}}"{% endif %}'
+        ' && {% if devserver is defined and devserver %}{% else %}!{%endif%}regexp(".*dev.*", Machine)'
+        " && InDownTime != true"
+    )
+
+    jinja_env = jinja2.Environment()
+    constraint_template = jinja_env.from_string(constraint)
+    try:
+        schedd_constraint = constraint_template.render(vargs)
+    except jinja2.TemplateError as e:
+        print(f"Could not render constraint template: {e}")
+        raise
+
     # pylint: disable-next=no-member
     coll = htcondor.Collector(COLLECTOR_HOST)
     # pylint: disable-next=no-member
-    schedd_classads = coll.locateAll(htcondor.DaemonTypes.Schedd)
+    if vargs.get("verbose", 0) > 0:
+        print(
+            f"Using the following constraint for finding schedds: {schedd_constraint}\n"
+        )
 
-    # locateAll gives a list of minimal classads... but
-    # need to directQuery for the full classads to check for
-    # SupportedVOList...
+    # Get schedd ads from collector and store them in memory
+    schedds: List[classad.ClassAd] = coll.query(
+        htcondor.htcondor.AdTypes.Schedd,
+        constraint=schedd_constraint,
+    )
+    __schedd_ads = {ad.eval("Name"): ad for ad in schedds}
 
     if vargs.get("verbose", 0) > 1:
-        print(f"schedd classads: {schedd_classads} ")
+        print(f"post-query schedd classads: {schedds} ")
 
-    # pick schedds who do or do not have "dev" in their name, depending if
-    # we have "devserver" set...
+    return schedds
 
-    if vargs.get("devserver", ""):
-        schedd_classads = [
-            ca for ca in schedd_classads if ca.eval("Machine").find("dev") != -1
-        ]
-    else:
-        schedd_classads = [
-            ca for ca in schedd_classads if ca.eval("Machine").find("dev") == -1
-        ]
 
-    # print("after dev check:" , [ca.eval("Machine") for ca in schedds])
+def get_schedd_names(vargs: Dict[str, Any]) -> List[str]:
+    """get jobsub* schedd names from collector"""
+    schedds = get_schedd_list(vargs)
+    res = []
+    for s in schedds:
+        name = s.eval("Name")
+        res.append(name)
+    return res
 
-    full_schedd_classads = []
-    for ca in schedd_classads:
-        full_schedd_classads.append(
-            # pylint: disable-next=no-member
-            coll.directQuery(htcondor.DaemonTypes.Schedd, name=ca.eval("Machine"))
+
+# pylint: disable-next=no-member
+def get_schedd(vargs: Dict[str, Any]) -> classad.ClassAd:
+    """pick a jobsub* schedd name from collector"""
+    schedds = get_schedd_list(vargs)
+    if len(schedds) == 0:
+        raise Exception("Error: No schedds satisfying the constraint were found")
+
+    # pick weights based on (inverse) of  duty cycle of schedd
+    weights = []
+    for s in schedds:
+        name = s.eval("Name")
+
+        # If user has specified a schedd, just use that one.  Don't worry about
+        #  weighting or anything like that
+        if vargs.get("schedd_for_testing", None):
+            if name == vargs["schedd_for_testing"]:
+                print(f"Using requested schedd {name}")
+                return s
+            continue
+
+        rdcdc = s.eval("RecentDaemonCoreDutyCycle")
+
+        # avoid dividing by zero, and really crazy weights for idle servers
+        # max it out at 1000
+        if rdcdc > 0.01:
+            weight = 10.0 / rdcdc
+        else:
+            weight = 1000.0
+
+        weights.append(weight)
+
+        if vargs.get("verbose", 0) > 0:
+            print(f"Schedd: {name} DutyCycle {rdcdc} weight {weight}")
+
+    # If we requested a specific schedd to test with, we should have found it by now and returned
+    # before we even got here.  If not, raise an error
+    if vargs.get("schedd_for_testing", None):
+        raise ValueError(
+            "Requested testing schedd not found.  Please either remomve "
+            "--schedd-for-testing flag or choose a different schedd to test "
+            "with."
         )
 
-    # Filters to pick our schedds
-    schedds = [
-        schedd_classad
-        for schedd_classad in full_schedd_classads
-        # Pick the jobsub_lite schedds in the pool
-        if (
-            ("IsJobsubLite" in schedd_classad)
-            and (schedd_classad.eval("IsJobsubLite") == True)
-        )
-        # Only get schedds whose SupportedVOLists include our VO (group)
-        and (
-            (
-                ("SupportedVOList" in schedd_classad)
-                and (schedd_classad.eval("SupportedVOList").find(vargs["group"]) != -1)
-            )
-        )
-        # Make sure we don't pick any schedds in downtime
-        and (
-            ("InDownTime" not in schedd_classad)
-            or (
-                ("InDownTime" in schedd_classad)
-                and (schedd_classad.eval("InDownTime") != True)
-            )
-        )
-    ]
-
-    res = random.choice(schedds)
+    res = random.choices(schedds, weights=weights)[0]
+    if vargs.get("verbose", 0) > 0:
+        print(f'Chose schedd {res.eval("Name")}')
     return res
 
 
@@ -155,31 +275,72 @@ def submit(
     cmd = f"/usr/bin/condor_submit -pool {COLLECTOR_HOST} {schedd_args} {qargs}"
     cmd = f"BEARER_TOKEN_FILE={os.environ['BEARER_TOKEN_FILE']} {cmd}"
     cmd = f"_condor_CREDD_HOST={schedd_name} {cmd}"
+    #
+    # set up to use our custom condor_vault_storer until we get
+    # the updated one in the condor release
+    #
+    jldir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cmd = f"_condor_SEC_CREDENTIAL_STORER={jldir}/bin/condor_vault_storer {cmd}"
+    #
     packages.orig_env()
-    if vargs.get("verbose", 0) > 0:
+    verbose = int(vargs.get("verbose", 0))
+    if verbose > 0:
         print(f"Running: {cmd}")
 
     try:
-        output = subprocess.run(
-            cmd, shell=True, stdout=subprocess.PIPE, encoding="UTF-8", check=False
-        )
-        sys.stdout.write(output.stdout)
+        # Submit the job!
+        with submit_vt(vargs["group"], vargs["role"], schedd_name, verbose):
+            output = subprocess.run(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="UTF-8",
+                check=False,
+            )
+            sys.stdout.write(output.stdout)
+
+        hl = f"\n{'=-'*30}\n\n"  # highlight line to make result stand out
 
         if output.returncode < 0:
             sys.stderr.write(
-                f"Error: Child was terminated by signal {-output.returncode}\n"
+                f"{hl}Error: Child was terminated by signal {-output.returncode}{hl}\n"
             )
             return None
 
         if output.returncode > 0:
+            specific_error_msg_list = []
+            # Specific error text cases.  For each kind of error message we want to make more
+            # user-friendly, search the output, generate the message, and append it to
+            # specific_errors_msg_list.
+
+            # 1. Number of submitted jobs > MAX_JOBS_PER_SUBMISSION
+            m = re.search(
+                "Number of submitted jobs would exceed MAX_JOBS_PER_SUBMISSION",
+                output.stderr,
+            )
+            if m:
+                msg = generate_error_message_for_too_many_procs(vargs, schedd_name)
+                specific_error_msg_list.append(msg)
+            ## Specify any more specific error messages here
+
+            specific_error_msgs = "\n".join(specific_error_msg_list)
             sys.stderr.write(
-                f"Error: condor_submit exited with failed status code {output.returncode}\n"
+                f"{hl}Error: condor_submit exited with failed status code {output.returncode}\n\n"
+                f"{specific_error_msgs}{hl}\n"
             )
             return None
 
+        # If we had a successful submission, give the job id to the user
         m = re.search(r"\d+ job\(s\) submitted to cluster (\d+).", output.stdout)
         if m:
-            print(f"Use job id {m.group(1)}.0@{schedd_name} to retrieve output")
+            print(f"{hl}Use job id {m.group(1)}.0@{schedd_name} to retrieve output{hl}")
+
+            # call any job_info commands requested with the jobid
+            for ji in vargs.get("job_info", []):
+                os.system(
+                    f'{ji} {m.group(1)}.0@{schedd_name} "{repr(sys.argv)}" </dev/null'
+                )
 
         return True
     except OSError as e:
@@ -307,15 +468,49 @@ class Job:
             raise Exception(f'attribute "{attr}" not found for job "{str(self)}"')
         return res[0].eval(attr)
 
-    def transfer_data(self) -> None:
+    def transfer_data(self, partial: bool = False) -> None:
         """
-        Transfer the output sandbox, akin to calling condor_transfer_data.
+        Transfer the output sandbox, akin to calling condor_transfer_data. If
+        partial is True, only fetch logs for the specified job, not the whole
+        cluster.
         """
         s = self._get_schedd()
         # always retrieve whole cluster even if we were specified with
-        # a particular process id, for backwards compatability with old
-        # jobsub_fetchlog
+        # a particular process id, unless partial is True
         ssc = self.cluster
-        self.cluster = True
+        if not partial:
+            self.cluster = True
         s.retrieve(self._constraint())
         self.cluster = ssc
+
+
+def generate_error_message_for_too_many_procs(
+    vargs: Dict[str, Any], schedd_name: str
+) -> str:
+    """
+    Number of submitted jobs > MAX_JOBS_PER_SUBMISSION, so generate an error message for that
+    """
+    default_msg = (
+        "There was an error obtaining the MAX_JOBS_PER_SUBMISSION from the schedd. "
+        "Please try breaking up your submission into clusters with fewer jobs."
+    )
+    try:
+        limit = __schedd_ads[schedd_name].eval("Jobsub_Max_Jobs_Per_Submission")
+    except (AttributeError, KeyError):
+        # For whatever reason, get_schedd_list was never called before calling submit
+        get_schedd_list(vargs, refresh_schedd_ads=True)
+        limit = __schedd_ads[schedd_name].eval("Jobsub_Max_Jobs_Per_Submission")
+    except ValueError:
+        # The classad exists but doesn't have this attribute at all.  Fall back to default
+        return default_msg
+
+    try:
+        msg = (
+            "MAX_JOBS_PER_SUBMISSION limits the number of jobs allowed in a submission. "
+            f"The limit is {limit}.\n"
+            f"Please break up your submission into clusters with at most {limit} jobs each."
+        )
+    except NameError:
+        return default_msg
+
+    return msg

@@ -19,12 +19,18 @@
 
 """ submit command for jobsub layer over condor """
 # pylint: disable=wrong-import-position,wrong-import-order,import-error
+import argparse
 import glob
 import hashlib
 import os
 import os.path
 import sys
 from typing import Union, List, Dict, Any
+
+if os.environ.get("LD_LIBRARY_PATH", ""):
+    os.environ["HIDE_LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    del os.environ["LD_LIBRARY_PATH"]
+    os.execv(sys.argv[0], sys.argv)
 
 #
 # we are in prefix/bin/jobsub_submit, so find our prefix
@@ -48,10 +54,18 @@ from get_parser import get_parser
 from condor import get_schedd, submit, submit_dag
 from dagnabbit import parse_dagnabbit
 from tarfiles import do_tarballs
-from utils import set_extras_n_fix_units, cleanup, backslash_escape_layer
+from utils import (
+    set_extras_n_fix_units,
+    cleanup,
+    backslash_escape_layer,
+    sanitize_lines,
+)
 from creds import get_creds
 from token_mods import get_job_scopes, use_token_copy
-import version
+from version import print_version, print_support_email
+from fake_ifdh import mkdir_p, cp
+import pool
+import skip_checks
 
 
 def get_basefiles(dlist: List[str]) -> List[str]:
@@ -158,6 +172,37 @@ def do_dataset_defaults(varg: Dict[str, Any]) -> None:
         varg["environment"].append(f"SAM_GROUP={experiment}")
 
 
+def transfer_sandbox(src_dir, dest_url):
+    """Transfer files from src_dir to sandbox with fake_ifdh (gfal-copy).
+    Nothing failing here is considered fatal, since it doesn't affect the job
+    itself, just log availability.
+
+    """
+    print("Transferring files to web sandbox...")
+    try:
+        mkdir_p(dest_url)
+    except Exception as e:
+        print(
+            f"warning: error creating sandbox, web logs will not be available for this submission: {e}"
+        )
+        return
+    for f in os.listdir(src_dir):
+        try:
+            cp(os.path.join(src_dir, f), os.path.join(dest_url, f))
+        except Exception as e:
+            print(
+                f"warning: error copying {f} to sandbox, will not be available through web logs: {e}"
+            )
+
+
+verbose = 0
+
+
+def get_env_list(name: str) -> List[str]:
+    """get a split comma separated list of strings from an environment variable"""
+    return [x for x in os.environ.get(name, "").split(",") if x]
+
+
 def main():
     """script mainline:
     - parse args
@@ -167,6 +212,7 @@ def main():
     - convert/render template files to submission files
     - launch
     """
+    global verbose
     # pylint: disable=too-many-statements
     parser = get_parser()
 
@@ -176,13 +222,41 @@ def main():
     backslash_escape_layer(sys.argv)
     args = parser.parse_args()
 
+    if not args.global_pool and os.environ.get("JOBSUB_GLOBAL_POOL", ""):
+        pool.set_pool(os.environ["JOBSUB_GLOBAL_POOL"])
+
+    # Allow environment variables to append to some command lists to get rid of
+    # need for poms_jobsub_wrapper to get in front of us on the path -- we will
+    # just set these and have a job-info script report the job id, etc.
+    args.environment.extend(get_env_list("JOBSUB_EXTRA_ENVIRONMENT"))
+    args.lines.extend(get_env_list("JOBSUB_EXTRA_LINES"))
+    args.job_info.extend(get_env_list("JOBSUB_EXTRA_JOB_INFO"))
+
+    sanitize_lines(args.lines)
+
+    verbose = args.verbose
+
+    # if they were trying to pass LD_LIBRARY_PATH to the job, get it from HIDE_LD_LIBRARY_PATH
+    if "LD_LIBRARY_PATH" in args.environment and os.environ.get(
+        "HIDE_LD_LIBRARY_PATH", ""
+    ):
+        args.environment = [
+            f"{x}={os.environ['HIDE_LD_LIBRARY_PATH']}" if x == "LD_LIBRARY_PATH" else x
+            for x in args.environment
+        ]
+
     if args.version:
-        print(f"jobsub_lite version {version.__version__}")
-        exit()
+        print_version()
 
     if args.support_email:
-        print(f"Email {version.__email__} for help.")
-        exit()
+        print_support_email()
+
+    if args.skip_check:
+        if args.verbose:
+            print(f"Will skip these checks: {args.skip_check}")
+        # Run all the setup items for each check to skip
+        for check in args.skip_check:
+            skip_checks.skip_check_setup(check)
 
     # We want to push users to use jobsub_submit --dag, but there are still some legacy
     # users who use the old jobsub_submit_dag executable.  This patches that use case
@@ -197,6 +271,8 @@ def main():
     args.force_proxy = True
     args.force_proxy = False
 
+    do_tarballs(args)
+
     varg = vars(args)
 
     proxy, token = get_creds(varg)
@@ -205,10 +281,8 @@ def main():
         print(f"proxy is : {proxy}")
         print(f"token is : {token}")
 
-    if args.debug:
+    if args.verbose:
         sys.stderr.write(f"varg: {repr(varg)}\n")
-
-    do_tarballs(args)
 
     schedd_add = get_schedd(varg)
     schedd_name = schedd_add.eval("Machine")
@@ -256,6 +330,8 @@ def main():
         parse_dagnabbit(d1, varg, submitdir, schedd_name, varg["verbose"] > 1)
         render_files(d2, varg, submitdir, dlist=[d2, submitdir])
         if not varg.get("no_submit", False):
+            if varg["outurl"]:
+                transfer_sandbox(submitdir, varg["outurl"])
             os.chdir(varg["submitdir"])
             submit_dag(os.path.join(submitdir, "dag.dag"), varg, schedd_name)
     elif args.dataset_definition:
@@ -272,6 +348,8 @@ def main():
         varg["N"] = saveN
         render_files(d1, varg, submitdir, dlist=[d1, d2, submitdir])
         if not varg.get("no_submit", False):
+            if varg["outurl"]:
+                transfer_sandbox(submitdir, varg["outurl"])
             os.chdir(varg["submitdir"])
             submit_dag(os.path.join(submitdir, "dataset.dag"), varg, schedd_name)
     elif args.maxConcurrent:
@@ -285,6 +363,8 @@ def main():
         varg["N"] = saveN
         render_files(d1, varg, submitdir, dlist=[d1, d2, submitdir])
         if not varg.get("no_submit", False):
+            if varg["outurl"]:
+                transfer_sandbox(submitdir, varg["outurl"])
             os.chdir(varg["submitdir"])
             submit_dag(os.path.join(submitdir, "maxconcurrent.dag"), varg, schedd_name)
     else:
@@ -293,7 +373,24 @@ def main():
         render_files(d, varg, submitdir)
         if not varg.get("no_submit", False):
             os.chdir(varg["submitdir"])
+            if varg["outurl"]:
+                transfer_sandbox(submitdir, varg["outurl"])
             submit(os.path.join(submitdir, "simple.cmd"), varg, schedd_name)
+
+    if args.verbose:
+        # remind folks where transferred data goes.
+        for f in args.orig_input_file:
+            print(
+                f"File {f}\n ... will be available as: $CONDOR_DIR_INPUT/{os.path.basename(f)}"
+            )
+        i = 0
+        for f in args.orig_tar_file_name:
+            print(
+                f"Contents of {f}\n ... will be available in $INPUT_TAR_DIR_LOCAL{'_'+str(i) if i else ''}"
+            )
+            i = i + 1
+        if args.orig_input_file or args.orig_tar_file_name:
+            print("in your job.")
 
     if varg.get("no_submit", False):
         print(f"Submission files are in: {varg['submitdir']}")
@@ -302,4 +399,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if verbose:
+            raise
+        sys.stderr.write(f"\n\nError: {e.__class__.__name__}: {str(e)}\n\n")
+        sys.exit(1)

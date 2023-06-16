@@ -15,20 +15,26 @@
 # limitations under the License.
 """ misc. utility functions """
 from collections import OrderedDict
+import classad  # type: ignore
 import datetime
 import os
 import os.path
 import re
 import socket
-import sys
 import subprocess
+import sys
 import uuid
 import shutil
 import time
-from typing import Union, Dict, Any, NamedTuple, Tuple, List
+from typing import Union, Dict, Any, NamedTuple, Tuple, List, Optional
 
-ONSITE_SITE_NAME = "Fermigrid"
+import version
+
+ONSITE_SITE_NAME = "FermiGrid"
 DEFAULT_USAGE_MODELS = ["DEDICATED", "OPPORTUNISTIC", "OFFSITE"]
+DEFAULT_SINGULARITY_IMAGE = (
+    "/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest"
+)
 
 
 def cleandir(d: str) -> None:
@@ -49,6 +55,15 @@ def cleanup(varg: Dict[str, Any]) -> None:
             sb = os.stat(entry.name)
             if entry.name.startswith("js_") and time.time() - sb.st_mtime > 604800:
                 cleandir(entry.name)
+
+
+def sanitize_lines(linelist: List[str]) -> None:
+    """check all the items in the linelist to see if they are a valid htcondor classad entries"""
+    for line in linelist:
+        try:
+            res = classad.parseOne(line)
+        except classad.ClassAdParseError as err:
+            raise SyntaxError(f"in --lines '{line}'")
 
 
 def fixquote(s: str) -> str:
@@ -116,21 +131,30 @@ def set_extras_n_fix_units(
         args["ipaddr"] = "unknown"
     args["proxy"] = proxy
     args["token"] = token
-    args["jobsub_version"] = "lite_v1_0"
+    args["jobsub_version"] = f"{version.__title__}-v{version.__version__}"
     args["kerberos_principal"] = get_principal()
     args["uid"] = str(os.getuid())
 
     if not "uuid" in args:
         args["uuid"] = str(uuid.uuid4())
     if not "date" in args:
-        args["date"] = datetime.datetime.now().strftime("%Y_%m_%d_%H%M%S")
+        now = datetime.datetime.now()
+        args["date"] = now.strftime("%Y_%m_%d")
+        args["datetime"] = now.strftime("%Y_%m_%d_%H%M%S")
     if args["verbose"] > 1:
         sys.stderr.write(
             f"checking args[executable]: {repr(args.get('executable', None))}\n"
         )
+
     if not args["executable"] and args["exe_arguments"]:
         args["executable"] = args["exe_arguments"][-1]
         args["exe_arguments"] = args["exe_arguments"][:-1]
+
+    # fixup collapsed DAG arguments.
+    args["exe_arguments"] = [
+        x.replace("$(CM1)", "${CM1}").replace("$(CM2)", "${CM2}")
+        for x in args["exe_arguments"]
+    ]
 
     if args["executable"]:
         args["full_executable"] = args["executable"]
@@ -153,8 +177,26 @@ def set_extras_n_fix_units(
     args["usage_model"] = site_and_usage_model.usage_models
     args["resource_provides_quoted"] = new_resource_provides
 
+    # Check site and blacklist to ensure there are no conflicts
+    check_site_and_blacklist(args.get("site", ""), args.get("blacklist", ""))
+
+    if not "outurl" in args:
+        args["outurl"] = ""
+        if "JOBSUB_OUTPUT_URL" in os.environ:
+            # the path included in the output url needs to be included in users'
+            # tokens with storage.create scope (only!)
+            base = os.environ["JOBSUB_OUTPUT_URL"]
+            # this path is sanity-checked when fetching logs, so we can't change
+            # it here without also changing the check in jobview (or whatever
+            # comes after it).
+            args["outurl"] = "/".join((base, args["date"], args["uuid"]))
+        else:
+            sys.stderr.write(
+                "warning: JOBSUB_OUTPUT_URL not defined, web logs will not be available for this submission\n"
+            )
+
     if not "outdir" in args:
-        args["outdir"] = f"{args['outbase']}/js_{args['date']}_{args['uuid']}"
+        args["outdir"] = f"{args['outbase']}/js_{args['datetime']}_{args['uuid']}"
         args["submitdir"] = args["outdir"]
 
     if not os.path.exists(args["outdir"]):
@@ -205,6 +247,23 @@ def set_extras_n_fix_units(
     # in, so guard against those kinds of things
     if args.get("lines"):
         args["lines"] = [line for line in args["lines"] if line not in ('""', "''")]
+        # Check --lines for SingularityImage, resolve the possible case where that AND --singularity-image
+        # are specified, as long as --no-singularity is not set
+        if not args.get("no_singularity", False):
+            args["singularity_image"], args["lines"] = resolve_singularity_image(
+                args.get("singularity_image", DEFAULT_SINGULARITY_IMAGE), args["lines"]
+            )
+        else:
+            # Strip out any line with "SingularityImage=" in it, since --no-singularity is specified
+            _lines = [line for line in args["lines"] if "SingularityImage=" not in line]
+            if len(_lines) != args["lines"]:
+                print(
+                    "Warning:  --lines contains a SingularityImage specification "
+                    "but --no-singularity was also passed on command line. "
+                    "jobsub_lite will remove the --lines parameter that contains "
+                    "SingularityImage."
+                )
+            args["lines"] = _lines
 
     #
     # allow short, medium, and long for duration values (--expected_lifetime, --timeout)
@@ -395,15 +454,19 @@ def resolve_site_and_usage_model(
     def _check_valid_site_usage_model_pair(
         sites: List[str], usage_models: List[str]
     ) -> None:
+        lower_sites = [s.lower() for s in sites]
         # Sanity-check the site-usage_model combination
         # Check 1:  If usage_models are only onsite, make sure sites is ONSITE_SITE_NAME, or sites is empty
-        if "OFFSITE" not in usage_models and sites not in ([ONSITE_SITE_NAME], [""]):
+        if "OFFSITE" not in usage_models and lower_sites not in (
+            [ONSITE_SITE_NAME.lower()],
+            [""],
+        ):
             raise SiteAndUsageModelConflictError(
                 ",".join(sites), ",".join(usage_models)
             )
 
         # Check 2:  If usage_models are only offsite, make sure sites does not include ONSITE_SITE_NAME
-        if usage_models == ["OFFSITE"] and ONSITE_SITE_NAME in sites:
+        if usage_models == ["OFFSITE"] and ONSITE_SITE_NAME.lower() in lower_sites:
             raise SiteAndUsageModelConflictError(
                 ",".join(sites), ",".join(usage_models)
             )
@@ -434,16 +497,29 @@ def resolve_site_and_usage_model(
         )
 
     usage_model_regex = re.compile("usage_model=(.+)")
+
+    # Correct case of onsite site if it's given
+    split_given = given_sites.split(",")
+    corrected_given_split = [
+        ONSITE_SITE_NAME if s.lower() == ONSITE_SITE_NAME.lower() else s
+        for s in split_given
+    ]  # If the wrong case was given for the onsite site, correct it.
+    given_sites_corrected = ",".join(corrected_given_split)
+
     derived_sites: str = ""
-    derived_sites_list = given_sites.split(",")
+    derived_sites_list = given_sites_corrected.split(",")
     # Case 1: --site provided on the command line.  Set usage model accordingly
-    if given_sites != "":
+    if given_sites_corrected != "":
         derived_usage_model_string = ""
-        if len(derived_sites_list) == 1 and derived_sites_list[0] == ONSITE_SITE_NAME:
+        if (
+            len(derived_sites_list) == 1
+            and derived_sites_list[0].lower() == ONSITE_SITE_NAME.lower()
+        ):
             # Just asking for ONSITE_SITE_NAME
             derived_usage_model_string = "DEDICATED,OPPORTUNISTIC"
         else:
-            if ONSITE_SITE_NAME in derived_sites_list:
+            derived_sites_list_lower = [d.lower() for d in derived_sites_list]
+            if ONSITE_SITE_NAME.lower() in derived_sites_list_lower:
                 # Asking for ONSITE_SITE_NAME and other sites
                 derived_usage_model_string = "DEDICATED,OPPORTUNISTIC,OFFSITE"
             else:
@@ -454,7 +530,7 @@ def resolve_site_and_usage_model(
         return (
             SiteAndUsageModel(
                 *_sanitize_sites_and_usage_models(
-                    given_sites, derived_usage_model_string
+                    given_sites_corrected, derived_usage_model_string
                 )
             ),
             _strip_usage_model_from_resource_provides(resource_provides_quoted),
@@ -465,8 +541,8 @@ def resolve_site_and_usage_model(
     if (given_usage_model != "") and (
         sorted(derived_usage_models) != sorted(DEFAULT_USAGE_MODELS)
     ):
-        if "OFFSITE" not in derived_usage_models and given_sites == "":
-            # If they've only asked for onsite, add Fermigrid in the sites list.  Not entirely necessary,
+        if "OFFSITE" not in derived_usage_models and given_sites_corrected == "":
+            # If they've only asked for onsite, add FermiGrid in the sites list.  Not entirely necessary,
             # but it makes explicit what the user has asked for
             derived_sites = ONSITE_SITE_NAME
             derived_sites_list = derived_sites.split(",")
@@ -508,6 +584,76 @@ def resolve_site_and_usage_model(
     )
 
 
+def resolve_singularity_image(
+    singularity_image_from_args: str, lines: List[str]
+) -> Tuple[str, List[str]]:
+    """
+    Determine what the proper --singularity-image flag should be, parsing both that flag and the --lines
+    arguments.  If --lines has a SingularityImage flag specified, we should remove that from --lines and
+    put it in the return value of singularity_image.
+
+    Order of precedence:
+    1. Non-default singularity-image argument
+    2. --lines SingularityImage argument
+    3. Default singularity-image argument
+
+    Returns a tuple of (singularity_image, lines (modified or not))
+    """
+    lines_singularity_re = re.compile(".+SingularityImage=(.+)")
+    lines_singularity_image: Optional[str] = None
+    return_lines: List[str] = []
+
+    # Parse lines.
+    # Look for something like:
+    #     '+SingularityImage=\\\"/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest\\\"'
+    # in lines and remove it while setting lines_singularity_image
+    # In the above example, if there were such a line, lines_singularity_image would be set to
+    # "/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest"
+    for line in lines:
+        m = lines_singularity_re.match(line)
+        if m:
+            raw_singularity_image = m.group(1)
+            # Since most of the time the SingularityImage here is heavily-escaped, we need to strip out all double-quotes and backslashes
+            lines_singularity_image = raw_singularity_image.strip('"\\')
+            msg = (
+                f"Warning: SingularityImage {lines_singularity_image} specified in "
+                "--lines.  A non-default --singularity-image value takes precedence, "
+                "but a non-default SingularityImage may be specified here for backward-compatibility. "
+                "--lines SingularityImage ONLY takes precedence over --singularity-image if "
+                "--singularity-image value is not the default and --no-singularity is not given "
+                "on the command line."
+            )
+            print(msg)
+        else:
+            return_lines.append(line)
+
+    # If we have a non-default --singularity-image given on the command line, use that
+    if singularity_image_from_args != DEFAULT_SINGULARITY_IMAGE:
+        return (singularity_image_from_args, return_lines)
+
+    # If SingularityImage is specified in lines, use that
+    if lines_singularity_image:
+        return (lines_singularity_image, return_lines)
+
+    return (DEFAULT_SINGULARITY_IMAGE, return_lines)
+
+
+def check_site_and_blacklist(site: str, blacklist: str) -> None:
+    """Check list of sites and blacklist to make sure there are no
+    conflicting options.  If there are conflicts, raise a SiteAndBlacklistConflictError.
+    Otherwise, return None.
+    """
+    # If we have empty --site and --blacklist, this is fine.
+    if (not site) or (not blacklist):
+        return None
+    site_set = set(site.split(","))
+    blacklist_set = set(blacklist.split(","))
+    common_sites = site_set.intersection(blacklist_set)
+    if common_sites:
+        raise SiteAndBlacklistConflictError(list(common_sites))
+    return None
+
+
 class SiteAndUsageModelConflictError(Exception):
     # Exception to raise if a site/usage model are in conflict
     def __init__(self, site: str, usage_model: str):
@@ -520,5 +666,20 @@ class SiteAndUsageModelConflictError(Exception):
             "requesting to run only OFFSITE, or that you are not requesting to "
             "run with OPPORTUNISTIC or DEDICATED usage_models while specifying "
             f"a site list that does not include {ONSITE_SITE_NAME}."
+        )
+        super().__init__(self.message)
+
+
+class SiteAndBlacklistConflictError(Exception):
+    """Exception to raise if any of the sites the user passed in are also in the user-passed
+    blacklist"""
+
+    def __init__(self, common_sites: List[str]):
+        self.common_sites = common_sites
+        self.message = (
+            "The following site(s) are both in the --site and --blacklist "
+            f"argument: {self.common_sites}. If your job tries to "
+            "run at one of these sites, it will never start.  Please adjust "
+            "either the --site list or the --blacklist list."
         )
         super().__init__(self.message)

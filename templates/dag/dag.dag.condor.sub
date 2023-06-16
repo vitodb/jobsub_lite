@@ -7,7 +7,7 @@ output		= dag.dag.lib.out
 error		= dag.dag.lib.err
 log		= dag.dag.dagman.log
 remove_kill_sig	= SIGUSR1
-transfer_input_files = {{",".join(transfer_files)}},dag.dag.condor.sub
+transfer_input_files = {{",".join(transfer_files)}}
 +OtherJobRemoveRequirements	= "DAGManJobId =?= $(cluster)"
 # Note: default on_exit_remove expression:
 # ( ExitSignal =?= 11 || (ExitCode =!= UNDEFINED && ExitCode >=0 && ExitCode <= 2))
@@ -26,7 +26,15 @@ environment	=  _CONDOR_SCHEDD_ADDRESS_FILE=/var/lib/condor/spool/.schedd_address
 +JobsubClientKerberosPrincipal="{{kerberos_principal}}"
 x509userproxy = {{proxy}}
 delegate_job_GSI_credentials_lifetime = 0
+{%if skip_check is defined and skip_check%}
++JobsubSkipChecks = "{{skip_check|join(",")}}"
+{%endif%}
 {{lines|join("\n")}}
+
+{% if generate_email_summary %}
+notify_user = "{{email_to}}"
+notification = Always
+{% endif %}
 
 {% if subgroup is defined and subgroup %}
 +AccountingGroup = "group_{{group}}.{{subgroup}}.{{user}}"
@@ -36,13 +44,15 @@ delegate_job_GSI_credentials_lifetime = 0
 
 +Jobsub_Group="{{group}}"
 +JobsubJobId="$(CLUSTER).$(PROCESS)@{{schedd}}"
++JobsubOutputURL="{{outurl}}"
++JobsubUUID="{{uuid}}"
 
 {% if role is defined and role and role != 'Analysis' %}
 use_oauth_services = {{group}}_{{role | lower}}
-#{{group}}_{{role | lower}}_oauth_permissions = "{{job_scope}}"
+{{group}}_{{role | lower}}_oauth_permissions_{{oauth_handle}} = " {{job_scope}} "
 {% else %}
 use_oauth_services = {{group}}
-#{{group}}_oauth_permissions = "{{job_scope}}"
+{{group}}_oauth_permissions_{{oauth_handle}} = " {{job_scope}} "
 {% endif %}
 
 queue

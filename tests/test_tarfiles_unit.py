@@ -1,6 +1,9 @@
 import os
 import sys
+import tarfile as tarfile_mod
 import time
+import tempfile
+import pathlib
 import pytest
 
 #
@@ -23,7 +26,6 @@ import tarfiles
 import get_parser
 
 from test_unit import TestUnit
-from test_creds_unit import needs_credentials
 
 
 class TestTarfilesUnit:
@@ -31,12 +33,37 @@ class TestTarfilesUnit:
     Use with pytest... unit tests for ../lib/*.py
     """
 
-    # lib/tarfiles.py routines...
+    dir_to_tar: tempfile.TemporaryDirectory = None
 
+    @classmethod
+    def setup_class(cls):
+        """Create our tar directory to tar up"""
+        cls.dir_to_tar = tempfile.TemporaryDirectory()
+        temp_path = pathlib.Path(cls.dir_to_tar.name)
+        subdir = temp_path / "subdir"
+        subdir.mkdir()
+        # Create test files to put in dir
+        for i in range(5):
+            filename = f"file_{i}"
+            writefile = temp_path / filename
+            writefile.write_text(f"This is file {i}")
+        subdir_file = subdir / "test_file"
+        subdir_file.write_text("This is a file in a subdirectory")
+        subdir_link = subdir / "test_link"
+        subdir_link.symlink_to(subdir_file)
+        subdir_hlink = subdir / "test_hlink"
+        os.link(str(subdir_file), str(subdir_hlink))
+
+    @classmethod
+    def teardown_class(cls):
+        """Delete any test remnants"""
+        cls.dir_to_tar.cleanup()
+
+    # lib/tarfiles.py routines...
     @pytest.mark.unit
     def test_tar_up_1(self):
         """make sure tar up makes a tarfile"""
-        tarfile = tarfiles.tar_up(os.path.dirname(__file__), None)
+        tarfile = tarfiles.tar_up(self.dir_to_tar.name, None)
         assert os.path.exists(tarfile)
         os.unlink(tarfile)
 
@@ -53,7 +80,7 @@ class TestTarfilesUnit:
         t1 = tarfiles.tar_up(
             os.path.dirname(__file__), "/dev/null", os.path.basename(__file__)
         )
-        h1, b1 = tarfiles.slurp_file(t1)
+        h1, _ = tarfiles.slurp_file(t1)
         print(f"h1: {h1}")
         os.system(f"md5sum {t1}")
         os.unlink(t1)
@@ -62,7 +89,7 @@ class TestTarfilesUnit:
         t2 = tarfiles.tar_up(
             os.path.dirname(__file__), "/dev/null", os.path.basename(__file__)
         )
-        h2, b2 = tarfiles.slurp_file(t2)
+        h2, _ = tarfiles.slurp_file(t2)
         print(f"h2: {h2}")
         os.system(f"md5sum {t2}")
         os.unlink(t2)
@@ -79,7 +106,7 @@ class TestTarfilesUnit:
         """test the tarfile publisher object"""
         proxy, token = needs_credentials
         # need something to publish...
-        tarfile = tarfiles.tar_up(os.path.dirname(__file__), None)
+        tarfile = tarfiles.tar_up(self.dir_to_tar.name, None)
         digest, tf = tarfiles.slurp_file(tarfile)
         cid = f"{TestUnit.test_group}/{digest}"
 
@@ -100,17 +127,17 @@ class TestTarfilesUnit:
         else:
             publisher.update_cid()
 
+        os.unlink(tarfile)
         assert location is not None
 
     @pytest.mark.unit
     def test_do_tarballs_1(self, needs_credentials):
         """test that the do_tarballs method does a dropbox:path
         processing"""
-        tdir = os.path.dirname(__file__)
         for dropbox_type in ["cvmfs", "pnfs"]:
             argv = [
                 "--tar_file_name",
-                "tardir:{0}".format(tdir),
+                "tardir:{0}".format(self.dir_to_tar.name),
                 "--use-{0}-dropbox".format(dropbox_type),
                 "--group",
                 TestUnit.test_group,
@@ -129,12 +156,11 @@ class TestTarfilesUnit:
     def test_do_tarballs_2(self, needs_credentials):
         """test that the do_tarballs method does a dropbox:path
         processing"""
-        tdir = os.path.dirname(__file__)
         for dropbox_type in ["cvmfs", "pnfs"]:
             print(f"dropbox type: {dropbox_type}\n===============")
             argv = [
                 "--tar_file_name",
-                "tardir://{0}".format(tdir),
+                "tardir://{0}".format(self.dir_to_tar.name),
                 "--use-{0}-dropbox".format(dropbox_type),
                 "--group",
                 TestUnit.test_group,
@@ -179,3 +205,60 @@ class TestTarfilesUnit:
     def x_test_do_tarballs_5(self):
         # should have another one here to test existing /cvmfs path
         pass
+
+    @pytest.mark.unit
+    def test_tarfile_publisher_glob_path(self, needs_credentials):
+        """Tests that the TarfilePublisherHandler glob path generator
+        returns the expected glob for the CID given"""
+        import re
+
+        proxy, token = needs_credentials
+        fake_cid = f"{TestUnit.test_group}/12345abcde"
+        tfh = tarfiles.TarfilePublisherHandler(fake_cid, proxy, token)
+        expected_pattern = r"/cvmfs/{(.+)}/sw/" + fake_cid
+        assert re.match(expected_pattern, tfh.get_glob_path_for_cid())
+
+    @pytest.mark.unit
+    def test_tarfile_publisher_cid_operation(self):
+        """Test the cid_operation decorator of the TarfilePublisherHandler."""
+        from collections import namedtuple
+
+        fake_cid = f"{TestUnit.test_group}/12345abcde"
+        fake_location = "thisisthepath"
+
+        # We have to use this fake object to mimic a requests.Response's structure:
+        # specifically, we need to return an object which has a "text"
+        # attribute from our test functions wrapped with the cid_operation
+        # handler, since the cid_operation decorator inspects the text
+        # attribute of the return value of the function it wraps
+        FakeTextContainer = namedtuple("FakeTextContainer", ["text"])
+
+        class FakePublisherHandler(tarfiles.TarfilePublisherHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+            @tarfiles.TarfilePublisherHandler.cid_operation
+            def fail_function(self):
+                return FakeTextContainer("thiswillnotmatch")
+
+            @tarfiles.TarfilePublisherHandler.cid_operation
+            def present_function(self):
+                return FakeTextContainer(f"PRESENT:{fake_location}")
+
+        f = FakePublisherHandler(cid=fake_cid)
+        assert f.fail_function() is None
+        assert f.present_function() == fake_location
+
+    @pytest.mark.unit
+    def test_tarchmod_not_tarfile(self, tmp_path):
+        """Test that if we give tarchmod a file that is not a tarfile to
+        operate on, it raises the appropriate error"""
+        # Make a temp file with some content in it that is not a tarball
+        CONTENT = "This is a fake temp file, not a tar archive"
+        tmp_file = tmp_path / "test_file.txt"
+        tmp_file.write_text(CONTENT)
+        assert tmp_file.read_text() == CONTENT
+
+        # The actual test
+        with pytest.raises(tarfile_mod.TarError):
+            tarfiles.tarchmod(str(tmp_file))

@@ -16,6 +16,7 @@ class TestUnit:
     """
 
     test_group = "fermilab"
+    test_role = "Analysis"
     # test_group = "dune"
     test_schedd = getschedd("devgpvm")
     test_vargs = {
@@ -30,15 +31,20 @@ class TestUnit:
         "devserver": True,
         "environment": ["USER"],
         "group": test_group,
+        "role": test_role,
         "N": 1,
         "maxConcurrent": None,
         "resource_provides": ["usage_model=OPPORTUNISTIC,DEDICATED,OFFSITE"],
         "job_scope": "storage.create:/foo storage:modify:/foo compute.create compute.modify compute.read",
         "oauth_handle": "0a1b2c3d4e5f",
         "project_name": "",
+        "job_info": [],
+        "generate_email_summary": False,
+        "dd_percentage": 100,
+        "dd_extra_dataset": [],
     }
     test_extra_template_args = {
-        "role": "Analysis",
+        "role": test_role,
         "clientdn": "test_client_dn",
         "ipaddr": "TEST.IP.ADDRESS",
         "user": "test_user",
@@ -53,4 +59,5 @@ class TestUnit:
         "email_to": "test_user@fnal.gov",
         "version": "test_version",
         "resource_provides_quoted": "usage_model=TEST",
+        "outurl": "https://www.fnal.gov",
     }

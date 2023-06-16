@@ -4,7 +4,7 @@ universe           = vanilla
 executable         = sambegin.sh
 arguments          =
 
-{% set filebase %}sambegin.$(Cluster)$(Process){% endset %}
+{% set filebase %}sambegin.$(Cluster).$(Process){% endset %}
 output             = {{filebase}}.out
 error              = {{filebase}}.err
 log                = {{filebase}}.log
@@ -14,23 +14,26 @@ notification  = Error
 +RUN_ON_HEADNODE= True
 rank               = Mips / 2 + Memory
 job_lease_duration = 3600
-notification       = Never
 transfer_error     = True
 transfer_executable= True
 when_to_transfer_output = ON_EXIT_OR_EVICT
 transfer_output_files = .empty_file
 request_memory = 100mb
+{%if     OS is defined and OS %}+DesiredOS="{{OS}}"{%endif%}
 +JobsubClientDN="{{clientdn}}"
 +JobsubClientIpAddress="{{ipaddr}}"
 +JobsubServerVersion="{{jobsub_version}}"
 +JobsubClientVersion="{{jobsub_version}}"
 +JobsubClientKerberosPrincipal="{{kerberos_principal}}"
 +JOB_EXPECTED_MAX_LIFETIME = {{expected_lifetime}}
-notify_user = {{email_to}}
 +AccountingGroup = "group_{{group}}.{{user}}"
 +Jobsub_Group="{{group}}"
 +JobsubJobId="$(CLUSTER).$(PROCESS)@{{schedd}}"
++JobsubOutputURL="{{outurl}}"
++JobsubUUID="{{uuid}}"
 +Drain = False
+# default for remote submits is to keep completed jobs in the queue for 10 days
++LeaveJobInQueue = False
 {% if site is defined and site != 'LOCAL' %}
 +DESIRED_SITES = "{{site}}"
 {% endif %}
@@ -41,9 +44,14 @@ notify_user = {{email_to}}
 {%if usage_model is defined and usage_model  %}
 +DESIRED_usage_model = "{{usage_model}}"
 {% endif %}
-{{resource_provides_quoted|join("\n+DESIRED_")}}
+{%if resource_provides_quoted%}
++DESIRED_{{resource_provides_quoted|join("\n+DESIRED_")}}
+{% endif %}
+{%if skip_check is defined and skip_check%}
++JobsubSkipChecks = "{{skip_check|join(",")}}"
+{%endif%}
 {{lines|join("\n")}}
-requirements = target.machine =!= MachineAttrMachine1 && target.machine =!= MachineAttrMachine2 && (isUndefined(DesiredOS) || stringListsIntersect(toUpper(DesiredOS),IFOS_installed)) && (stringListsIntersect(toUpper(target.HAS_usage_model), toUpper(my.DESIRED_usage_model))){%if site is defined and site != '' %} && ((isUndefined(target.GLIDEIN_Site) == FALSE) && (stringListIMember(target.GLIDEIN_Site,my.DESIRED_Sites))){%endif%}{%if append_condor_requirements is defined and append_condor_requirements %} && {{append_condor_requirements}}{%endif%}
+requirements = target.machine =!= MachineAttrMachine1 && target.machine =!= MachineAttrMachine2 && (isUndefined(DesiredOS) || stringListsIntersect(toUpper(DesiredOS),IFOS_installed)) && (stringListsIntersect(toUpper(target.HAS_usage_model), toUpper(my.DESIRED_usage_model))){%if site is defined and site != '' %} && ((isUndefined(target.GLIDEIN_Site) == FALSE) && (stringListIMember(target.GLIDEIN_Site,my.DESIRED_Sites))){%endif%}{%if blacklist is defined and blacklist != '' %} && ((isUndefined(target.GLIDEIN_Site) == FALSE) && (!stringListIMember(target.GLIDEIN_Site,my.Blacklist_Sites))){%endif%}{%if append_condor_requirements is defined and append_condor_requirements %} && {{append_condor_requirements}}{%endif%}
 
 
 {% if no_singularity is false %}
@@ -53,10 +61,10 @@ requirements = target.machine =!= MachineAttrMachine1 && target.machine =!= Mach
 # Credentials
 {% if role is defined and role and role != 'Analysis' %}
 use_oauth_services = {{group}}_{{role | lower}}
-#{{group}}_{{role | lower}}_oauth_permissions = "{{job_scope}}"
+{{group}}_{{role | lower}}_oauth_permissions_{{oauth_handle}}  = " {{job_scope}} "
 {% else %}
 use_oauth_services = {{group}}
-#{{group}}_oauth_permissions = "{{job_scope}}"
+{{group}}_oauth_permissions_{{oauth_handle}} = " {{job_scope}} "
 {% endif %}
 {% if role is defined %}
 +x509userproxy = "{{proxy|basename}}"

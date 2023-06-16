@@ -19,9 +19,12 @@ import argparse
 import os
 import re
 import sys
-from typing import Union, Any
+from typing import Union, Any, List
 
-from utils import DEFAULT_USAGE_MODELS
+import pool
+from skip_checks import SupportedSkipChecks
+from utils import DEFAULT_USAGE_MODELS, DEFAULT_SINGULARITY_IMAGE
+from condor import get_schedd_names
 
 
 def verify_executable_starts_with_file_colon(s: str) -> str:
@@ -62,6 +65,53 @@ class ConvertDebugToVerbose(argparse.Action):
         setattr(namespace, "verbose", 1)
 
 
+class VerifyAndAddSkipCheck(argparse.Action):
+    """Action to verify that the given skip-check argument is in the allowed
+    list of checks to skip.  If it supported, the argument is added to the list
+    of checks to skip, and the attribute skip_check_{argument} is set to True in
+    the given namespace"""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Union[None, str] = None,
+    ) -> None:
+        _supported_checks = SupportedSkipChecks.get_all_checks()
+        if values not in _supported_checks:
+            raise TypeError(
+                f'Invalid argument to flag --skip-check: "{values}". Value must '
+                f"be one of the following: {_supported_checks}"
+            )
+        checks_to_skip = getattr(namespace, self.dest, [])
+        if values not in checks_to_skip:
+            checks_to_skip.append(values)
+            setattr(namespace, self.dest, checks_to_skip)
+            new_arg_to_set = f"skip_check_{values}"
+            setattr(namespace, new_arg_to_set, True)
+
+
+class CheckIfValidSchedd(argparse.Action):
+    """Action to check if the tester has requested a valid schedd to submit to"""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Union[None, str] = None,
+    ) -> None:
+        group = os.environ.get("JOBSUB_GROUP", os.environ.get("GROUP", None))
+        vargs = {"group": group} if group is not None else {}
+        valid_schedds = get_schedd_names(vargs)
+        if values not in valid_schedds:
+            raise TypeError(
+                f"Invalid schedd specified: {values}.  Valid choices are {valid_schedds}"
+            )
+        setattr(namespace, self.dest, values)
+
+
 def get_base_parser(add_condor_epilog: bool = False) -> argparse.ArgumentParser:
     """build the general jobsub command argument parser and return it"""
 
@@ -87,6 +137,13 @@ def get_base_parser(add_condor_epilog: bool = False) -> argparse.ArgumentParser:
         action=StoreGroupinEnvironment,
         default=os.environ.get("GROUP", None),
     )
+    parser.add_argument(
+        "--global-pool",
+        default="",
+        action=pool.SetPool,
+        help="direct jobs/commands to a particular known global pool."
+        f"Currently known pools are: {' '.join(pool.get_poolmap().keys())}",
+    )
     group.add_argument(
         "--role",
         help="VOMS Role for priorities and accounting",
@@ -107,6 +164,12 @@ def get_base_parser(add_condor_epilog: bool = False) -> argparse.ArgumentParser:
         nargs=0,
         help="dump internal state of program (useful for debugging)",
     )
+    parser.add_argument(
+        "--devserver",
+        default=False,
+        action="store_true",
+        help="Use jobsubdevgpvm01 etc. to submit",
+    )
     group.add_argument(
         "--version",
         action="store_true",
@@ -119,18 +182,41 @@ def get_base_parser(add_condor_epilog: bool = False) -> argparse.ArgumentParser:
         help="jobsub_lite support email",
         default=False,
     )
+    parser.add_argument(
+        "--schedd-for-testing",  # Non-advertised option for testers to direct jobs to certain schedds
+        type=str,
+        action=CheckIfValidSchedd,
+        help=argparse.SUPPRESS,
+    )
+    return parser
+
+
+def get_submit_parser(add_condor_epilog: bool = False) -> argparse.ArgumentParser:
+    """build the jobsub argument parser for the condor_submit/condor_submit_dag commands and return it"""
+    parser = get_base_parser(add_condor_epilog=add_condor_epilog)
+    parser.add_argument(
+        "--job-info",
+        action="append",
+        default=[],
+        help="script to call with jobid and command line when job is submitted",
+    )
     return parser
 
 
 def get_jobid_parser(add_condor_epilog: bool = False) -> argparse.ArgumentParser:
+    """build the jobsub_cmd (jobsub_q, etc.) argument parser and return it"""
     parser = get_base_parser(add_condor_epilog=add_condor_epilog)
     parser.add_argument("-J", "--jobid", dest="jobid", help="job/submission ID")
+    parser.add_argument(
+        "--constraint",
+        help="Condor constraint to filter jobs returned.  See https://htcondor.readthedocs.io/en/latest/classads/classad-mechanism.html for more details",
+    )
     return parser
 
 
 def get_parser() -> argparse.ArgumentParser:
     """build the jobsub_submit argument parser and return it"""
-    parser = get_base_parser()
+    parser = get_submit_parser()
     parser.add_argument(
         "-c",
         "--append-condor-requirements",
@@ -138,13 +224,16 @@ def get_parser() -> argparse.ArgumentParser:
         help="append condor requirements",
     )
     parser.add_argument(
-        "--blacklist", help="enusure that jobs do not land at these sites"
+        "--blacklist",
+        help="ensure that jobs do not land at these (comma-separated) sites",
+        default="",
     )
     parser.add_argument("-r", help="Experiment release version")
     parser.add_argument("-i", help="Experiment release dir")
     parser.add_argument("-t", help="Experiment test release dir")
     parser.add_argument(
         "--cmtconfig",
+        default=os.environ.get("CMTCONFIG", ""),
         help=" Set up minervasoft release built with cmt configuration. default is $CMTCONFIG",
     )
     parser.add_argument("--cpu", help="request worker nodes have at least NUMBER cpus")
@@ -161,12 +250,24 @@ def get_parser() -> argparse.ArgumentParser:
         help="SAM dataset definition used in a Directed Acyclic Graph (DAG)",
     )
     parser.add_argument(
+        "--dd-percentage",
+        help="percentage to apply to SAM dataset size for --dataset-definition start job.",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--dd-extra-dataset",
+        help="SAM dataset definition start script extra dataset to check as staged. You can add multiple of them.",
+        action="append",
+        default=[],
+    )
+    parser.add_argument(
         "--disk",
         help="Request worker nodes have at least NUMBER[UNITS] of disk space."
         " If UNITS is not specified default is 'KB' (a typo in earlier"
         " versions said that default was 'MB', this was wrong)."
         " Allowed values for UNITS are 'KB','MB','GB', and 'TB'",
-        default="35GB",
+        default="10GB",
     )
     parser.add_argument(
         "-d",
@@ -275,8 +376,8 @@ def get_parser() -> argparse.ArgumentParser:
         "--mail-never",
         dest="mail",
         action="store_const",
-        const="never",
-        default="never",
+        const="Never",
+        default="Never",
         help="never send mail about job results (default)",
     )
 
@@ -285,16 +386,16 @@ def get_parser() -> argparse.ArgumentParser:
         "--mail-on-error",
         dest="mail",
         action="store_const",
-        const="on_error",
-        help="never send mail about job results (default)",
+        const="Error",
+        help="send mail about job results if job fails",
     )
     parser.add_argument(
         "--mail_always",
         "--mail-always",
         dest="mail",
         action="store_const",
-        const="always",
-        help="never send mail about job results (default)",
+        const="Always",
+        help="send mail about job results",
     )
 
     parser.add_argument(
@@ -359,11 +460,20 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resource-provides",
         action="append",
-        default=[""],
+        default=[],
         help="request specific resources by changing condor jdf file. For"
         " example: --resource-provides=CVMFS=OSG will add"
         ' +DESIRED_CVMFS="OSG" to the job classad attributes and'
         " '&&(CVMFS==\"OSG\")' to the job requirements",
+    )
+    parser.add_argument(
+        "--skip-check",
+        type=str,
+        action=VerifyAndAddSkipCheck,
+        default=[],
+        help="Skip checks that jobsub_lite does by default.  Add as many --skip-check "
+        f"flags as desired.  Available checks are {SupportedSkipChecks.get_all_checks()}. "
+        "Example:  --skip-check rcds",
     )
     parser.add_argument(
         "--tar_file_name",
@@ -418,12 +528,6 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
-        "--devserver",
-        default=False,
-        action="store_true",
-        help="Use jobsubdevgpvm01 etc. to submit",
-    )
-    parser.add_argument(
         "executable",
         type=verify_executable_starts_with_file_colon,
         default=None,
@@ -461,7 +565,7 @@ def get_parser() -> argparse.ArgumentParser:
     singularity_group.add_argument(
         "--singularity-image",
         "--apptainer-image",
-        default="/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest",
+        default=DEFAULT_SINGULARITY_IMAGE,
         help="Singularity image to run jobs in.  Default is "
         "/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest",
     )
